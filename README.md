@@ -13,9 +13,11 @@ Only use this tool on targets where you have **explicit written authorization**.
 sudo apt update && sudo apt install -y git
 git clone https://github.com/Zero-F0X/ZeroFox_V2.git
 pip install --upgrade pip
-pip install -r requirements.txt
 python -m playwright install chromium
-cd ZeroFox-V2
+cd ZeroFox_V2
+pip install -r requirements.txt
+
+
 ```
 
 2. Edit `xss.txt` (place your payloads). The repository includes a small sample; replace with your approved list.
