@@ -10,18 +10,19 @@ Only use this tool on targets where you have **explicit written authorization**.
 ## Quick setup (Ubuntu)
 1. Create Python venv:
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+sudo apt update && sudo apt install -y git
+git clone https://github.com/Zero-F0X/ZeroFox-V2.git
 pip install --upgrade pip
 pip install -r requirements.txt
 python -m playwright install chromium
+cd ZeroFox-V2
 ```
 
 2. Edit `xss.txt` (place your payloads). The repository includes a small sample; replace with your approved list.
 
 3. Run:
 ```bash
-python zerofox_v2.py
+python3 zerofox_v2.py
 ```
 
 ## Notes
