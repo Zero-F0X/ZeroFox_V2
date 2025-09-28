@@ -24,7 +24,15 @@ pip install -r requirements.txt
 
 3. Run:
 ```bash
+# Scan normal
 python3 zerofox_v2.py
+
+# Scan lebih agresif
+python3 zerofox_v2.py --workers 15 --rate-limit 0.02 --timeout 2
+
+# Scan super cepat (berisiko berat)
+python3 zerofox_v2.py --workers 30 --rate-limit 0.005 --timeout 1
+
 ```
 
 ## Notes
