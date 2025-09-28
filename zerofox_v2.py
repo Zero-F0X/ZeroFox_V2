@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# ZeroFox v2 - Fast + Realtime XSS Reporting + Spooky UI
+# ZeroFox v2 - XSS Scanner with scan-time loading animation
 # Use ONLY on authorized targets.
 
 import os
@@ -9,7 +9,6 @@ import time
 import random
 import re
 import urllib.parse
-import subprocess
 import requests
 import urllib3
 import threading
@@ -20,14 +19,14 @@ import concurrent.futures
 
 # Third-party
 try:
-    from colorama import Fore, Back, Style, init as colorama_init
+    from colorama import Fore, Style, init as colorama_init
     from bs4 import BeautifulSoup
 except Exception as e:
     print("Missing dependencies. Install with: pip install requests beautifulsoup4 colorama")
     raise e
 
-# Optional playwright
-HEADLESS_ENABLED = True
+# Optional Playwright (kept optional)
+HEADLESS_ENABLED = False
 _playwright_available = False
 if HEADLESS_ENABLED:
     try:
@@ -40,19 +39,18 @@ colorama_init(autoreset=True)
 urllib3.disable_warnings()
 
 # -------------------------
-# CONFIG (default values, can be overridden by CLI)
+# Defaults (override via CLI)
 # -------------------------
 XSS_PAYLOAD_FILE = "xss.txt"
 RATE_LIMIT = 0.10
 REQUEST_TIMEOUT = 8
 SHORT_TIMEOUT = 3
 SAVE_EVIDENCE = True
-PLAYWRIGHT_LAUNCH_OPTIONS = {"headless": True, "timeout": 15000}
 MAX_WORKERS = 8
 UI_UPDATE_INTERVAL = 0.06
 
 # -------------------------
-# Fancy UI elements
+# UI helpers
 # -------------------------
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
@@ -65,44 +63,40 @@ def slow_print(text, delay=0.005, end="\n"):
     sys.stdout.write(end)
     sys.stdout.flush()
 
-def typing_effect(lines, w_delay=0.01, between=0.12):
+def typing_effect(lines, w_delay=0.01, between=0.10):
     for line in lines:
         slow_print(line, delay=w_delay)
         time.sleep(between)
 
-def big_banner():
-    banner = r"""
- ███████████ ██████████ ███████████      ███████       ███████████    ███████    █████ █████   
-░█░░░░░░███ ░░███░░░░░█░░███░░░░░███   ███░░░░░███    ░░███░░░░░░█  ███░░░░░███ ░░███ ░░███    
-░     ███░   ░███  █ ░  ░███    ░███  ███     ░░███    ░███   █ ░  ███     ░░███ ░░███ ███     
-     ███     ░██████    ░██████████  ░███      ░███    ░███████   ░███      ░███  ░░█████      
-    ███      ░███░░█    ░███░░░░░███ ░███      ░███    ░███░░░█   ░███      ░███   ███░███     
-  ████     █ ░███ ░   █ ░███    ░███ ░░███     ███     ░███  ░    ░░███     ███   ███ ░░███    
- ███████████ ██████████ █████   █████ ░░░███████░      █████       ░░░███████░   █████ █████   
-░░░░░░░░░░░ ░░░░░░░░░░ ░░░░░   ░░░░░    ░░░░░░░       ░░░░░          ░░░░░░░    ░░░░░ ░░░░░                                                            
-    """
-    print(Fore.RED + Style.BRIGHT + banner + Style.RESET_ALL)
+def banner():
+    b = r"""
+ ███████████ ██████████ ███████████      ███████       ███████████
+░█░░░░░░███ ░░███░░░░░█░░███░░░░░███   ███░░░░░███    ░░███░░░░░░█
+░     ███░   ░███  █ ░  ░███    ░███  ███     ░░███    ░███   █ ░
+     ███     ░██████    ░██████████  ░███      ░███    ░███████
+    ███      ░███░░█    ░███░░░░░███ ░███      ░███    ░███░░░█
+  ████     █ ░███ ░   █ ░███    ░███ ░░███     ███     ░███  ░
+ ███████████ ██████████ █████   █████ ░░░███████░      █████
+"""
+    print(Fore.RED + Style.BRIGHT + b + Style.RESET_ALL)
     intro = [
-        Fore.LIGHTBLACK_EX + "ZeroFox v2" + Style.RESET_ALL + " — Http Recon & XSS Scanner (authorized use only).",
-        Fore.YELLOW + "Initializing modules..." + Style.RESET_ALL
+        Fore.LIGHTBLACK_EX + "ZeroFox v2" + Style.RESET_ALL + " — XSS Scanner (authorized use only).",
+        Fore.YELLOW + "Starting modules..." + Style.RESET_ALL
     ]
-    typing_effect(intro, w_delay=0.01, between=0.12)
+    typing_effect(intro, w_delay=0.01, between=0.08)
 
-def matrix_rain(lines=6, width=72, delay=0.015):
-    charset = "01"
-    for _ in range(lines):
-        line = ''.join(random.choice(charset) for _ in range(width))
-        print(Fore.GREEN + line + Style.RESET_ALL)
-        time.sleep(delay)
-
-def killer_startup_animation():
+def startup_animation():
     clear_screen()
-    big_banner()
-    matrix_rain(lines=6, width=72, delay=0.015)
+    banner()
+    # small matrix
+    for _ in range(4):
+        line = "".join(random.choice("01") for _ in range(60))
+        print(Fore.GREEN + line + Style.RESET_ALL)
+        time.sleep(0.03)
     print()
 
 # -------------------------
-# Helpers
+# File / payload helpers
 # -------------------------
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
@@ -132,51 +126,152 @@ def inject_payload(url, payload):
     except Exception:
         return url
 
+def save_evidence_html(outdir, safe_name, payload, resp_text):
+    ev_dir = ensure_dir(os.path.join(outdir, "evidence"))
+    fn = os.path.join(ev_dir, f"{safe_name}.html")
+    try:
+        with open(fn, "w", encoding="utf-8") as f:
+            f.write(f"<!-- payload: {payload} -->\n")
+            f.write(resp_text)
+    except Exception:
+        pass
+    return fn
+
 # -------------------------
-# XSS Scanning (simplified)
+# Scan animation (spinner + progress + immediate found)
 # -------------------------
-def _scan_url_worker(url, payloads, outdir, rate_limit, request_timeout):
+def scan_animation(stop_event, counters, total, found_q):
+    spinner = ["|", "/", "-", "\\"]
+    width = 36
+    idx = 0
+    try:
+        while not stop_event.is_set():
+            scanned = counters.get("scanned", 0)
+            found = counters.get("found", 0)
+            pct = int((scanned / total) * 100) if total else 0
+            filled = int((pct / 100) * width)
+            bar = "█" * filled + "-" * (width - filled)
+            spin = spinner[idx % len(spinner)]
+            # clear small area
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.write(Fore.CYAN + f" ZeroFox v2 — SCANNING\n" + Style.RESET_ALL)
+            sys.stdout.write(Fore.YELLOW + f" [{spin}] {scanned}/{total} URLs scanned | Found: {found}\n" + Style.RESET_ALL)
+            sys.stdout.write(Fore.RED + f" Progress: [{bar}] {pct}%\n" + Style.RESET_ALL)
+            # show up to 4 immediate founds
+            try:
+                for _ in range(4):
+                    u = found_q.get_nowait()
+                    sys.stdout.write(Fore.MAGENTA + Style.BRIGHT + f" >>> FOUND: {u}\n" + Style.RESET_ALL)
+            except queue.Empty:
+                pass
+            sys.stdout.flush()
+            time.sleep(UI_UPDATE_INTERVAL * 6)
+            idx += 1
+    finally:
+        sys.stdout.write("\x1b[2J\x1b[H")
+        sys.stdout.flush()
+
+# -------------------------
+# Worker (fast checks)
+# -------------------------
+def _scan_url_worker(url, payloads, outdir, rate_limit, timeout, found_q):
     session = requests.Session()
     session.headers.update({"User-Agent": "ZeroFox-v2/1.0"})
     try:
-        for payload in payloads:
-            test_url = inject_payload(url, payload)
+        for p in payloads:
+            test = inject_payload(url, p)
             try:
-                r = session.get(test_url, timeout=request_timeout, verify=False)
-                resp = r.text or ""
-                if payload in resp or urllib.parse.unquote_plus(payload) in resp:
-                    print(Fore.RED + f"[FOUND] {test_url}" + Style.RESET_ALL)
-                    return test_url
+                r = session.get(test, timeout=timeout, verify=False)
+                text = r.text or ""
+                dec = urllib.parse.unquote_plus(p)
+                if p in text or dec in text:
+                    # save evidence quickly
+                    safe = re.sub(r'[^0-9A-Za-z\-_\.]', '_', test)[:160]
+                    if SAVE_EVIDENCE:
+                        save_evidence_html(outdir, safe + "__resp", p, text)
+                    found_q.put(test)
+                    return test
             except Exception:
                 pass
             finally:
-                time.sleep(rate_limit)
+                if rate_limit:
+                    time.sleep(rate_limit)
     finally:
-        session.close()
+        try:
+            session.close()
+        except:
+            pass
     return None
 
-def optimized_scan_xss(urls, outdir, payloads):
+# -------------------------
+# Optimized scan with animation + immediate reporting
+# -------------------------
+def optimized_scan_xss(urls, outdir, payloads, workers, rate_limit, timeout):
     hits = []
-    if not payloads:
+    target = [u for u in urls if "?" in u]
+    total = len(target)
+    print(Fore.CYAN + f"[i] Scanning {total} parameterized URLs with {workers} workers..." + Style.RESET_ALL)
+    if total == 0 or not payloads:
+        print(Fore.YELLOW + "[!] Nothing to scan (no parameterized URLs or no payloads)." + Style.RESET_ALL)
         return hits
 
-    target_urls = [u for u in urls if "?" in u]
-    total_urls = len(target_urls)
-    print(Fore.CYAN + f"[i] Starting XSS scan: {total_urls} parameterized URL(s)" + Style.RESET_ALL)
+    counters = {"scanned": 0, "found": 0}
+    counters_lock = threading.Lock()
+    found_q = queue.Queue()
+    stop_anim = threading.Event()
+    anim_thread = threading.Thread(target=scan_animation, args=(stop_anim, counters, total, found_q), daemon=True)
+    anim_thread.start()
 
-    workers = min(MAX_WORKERS, max(1, total_urls))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(_scan_url_worker, u, payloads, outdir, RATE_LIMIT, SHORT_TIMEOUT): u for u in target_urls}
-        for fut in concurrent.futures.as_completed(futures):
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    futures = []
+
+    def _cb(fut, url):
+        nonlocal counters
+        try:
             res = fut.result()
-            if res:
-                hits.append(res)
+            with counters_lock:
+                counters["scanned"] += 1
+                if res:
+                    counters["found"] += 1
+        except Exception as e:
+            with counters_lock:
+                counters["scanned"] += 1
+            with open("scan_errors.log", "a", encoding="utf-8") as ef:
+                ef.write(f"{time.asctime()} - error scanning {url}: {e}\n")
 
+    try:
+        for u in target:
+            fut = executor.submit(_scan_url_worker, u, payloads, outdir, rate_limit, timeout, found_q)
+            fut.add_done_callback(lambda f, url=u: _cb(f, url))
+            futures.append(fut)
+
+        # wait for completion; founds are printed via animation (from queue)
+        concurrent.futures.wait(futures)
+    except KeyboardInterrupt:
+        print(Fore.RED + "\n[!] Aborted by user. Waiting for threads to finish..." + Style.RESET_ALL)
+        executor.shutdown(wait=False)
+    finally:
+        try:
+            executor.shutdown(wait=True)
+        except:
+            pass
+
+    # stop animation and drain found queue
+    stop_anim.set()
+    anim_thread.join()
+    while not found_q.empty():
+        try:
+            hits.append(found_q.get_nowait())
+        except queue.Empty:
+            break
+
+    hits = sorted(set(hits))
     save_list(os.path.join(outdir, "xss_found_urls.txt"), hits)
+    print(Fore.GREEN + f"[✓] Scan finished. {len(hits)} vulnerable endpoints found. Results saved to {outdir}/xss_found_urls.txt" + Style.RESET_ALL)
     return hits
 
 # -------------------------
-# Other scans
+# Crawling helpers (simple)
 # -------------------------
 def find_urls(domain, outdir):
     try:
@@ -190,9 +285,9 @@ def find_urls(domain, outdir):
 def crawl_site(start_url, outdir, max_depth=2):
     from urllib.parse import urljoin
     domain = urllib.parse.urlparse(start_url).netloc
-    visited, queue_, found = set(), [(start_url, 0)], []
-    while queue_:
-        url, depth = queue_.pop(0)
+    visited, q, found = set(), [(start_url, 0)], []
+    while q:
+        url, depth = q.pop(0)
         if url in visited or depth > max_depth:
             continue
         visited.add(url)
@@ -200,11 +295,11 @@ def crawl_site(start_url, outdir, max_depth=2):
             r = requests.get(url, timeout=REQUEST_TIMEOUT, verify=False)
             soup = BeautifulSoup(r.text, "html.parser")
             for link in soup.find_all("a", href=True):
-                full_url = urljoin(url, link['href'])
-                if domain in full_url and full_url not in visited:
-                    if "?" in full_url or "=" in full_url:
-                        found.append(full_url)
-                    queue_.append((full_url, depth + 1))
+                full = urljoin(url, link['href'])
+                if domain in full and full not in visited:
+                    if "?" in full or "=" in full:
+                        found.append(full)
+                    q.append((full, depth + 1))
         except Exception:
             continue
     save_list(os.path.join(outdir, "crawled_urls.txt"), sorted(set(found)))
@@ -213,56 +308,50 @@ def crawl_site(start_url, outdir, max_depth=2):
 # -------------------------
 # Flow
 # -------------------------
-def scan_all(urls, domain):
+def scan_domain(domain, workers, rate_limit, timeout):
     outdir = f"output/{domain}"
     ensure_dir(outdir)
-    payloads = load_xss_payloads(XSS_PAYLOAD_FILE)
-    hits = optimized_scan_xss(urls, outdir, payloads)
-    print(Fore.GREEN + f"[✓] Scan selesai — {len(hits)} bug ditemukan." + Style.RESET_ALL)
-
-def scan_domain(domain):
-    outdir = f"output/{domain}"
-    ensure_dir(outdir)
+    print(Fore.CYAN + f"[~] Gathering URLs for {domain}..." + Style.RESET_ALL)
     wayback = find_urls(domain, outdir)
     crawled = crawl_site(f"http://{domain}", outdir)
     urls = list(set(wayback + crawled))
     save_list(os.path.join(outdir, "all_urls.txt"), urls)
-    scan_all(urls, domain)
+    payloads = load_xss_payloads(XSS_PAYLOAD_FILE)
+    optimized_scan_xss(urls, outdir, payloads, workers, rate_limit, timeout)
 
 # -------------------------
 # CLI
 # -------------------------
 def parse_args():
     parser = argparse.ArgumentParser(description="ZeroFox v2 — XSS Scanner (authorized use only)")
-    parser.add_argument("--workers", type=int, default=8, help="Jumlah worker paralel (default: 8)")
-    parser.add_argument("--rate-limit", type=float, default=0.10, help="Delay antar request (detik, default: 0.10)")
-    parser.add_argument("--timeout", type=int, default=3, help="Timeout request singkat (detik, default: 3)")
+    parser.add_argument("--workers", type=int, default=MAX_WORKERS, help="Jumlah worker paralel (default: 8)")
+    parser.add_argument("--rate-limit", type=float, default=RATE_LIMIT, help="Delay antar request (detik, default: 0.10)")
+    parser.add_argument("--timeout", type=int, default=SHORT_TIMEOUT, help="Timeout singkat request (detik, default: 3)")
     return parser.parse_args()
 
 def main():
-    global MAX_WORKERS, RATE_LIMIT, SHORT_TIMEOUT
     args = parse_args()
-    MAX_WORKERS = args.workers
-    RATE_LIMIT = args.rate_limit
-    SHORT_TIMEOUT = args.timeout
+    global MAX_WORKERS, RATE_LIMIT, SHORT_TIMEOUT
+    MAX_WORKERS = max(1, int(args.workers))
+    RATE_LIMIT = max(0.0, float(args.rate_limit))
+    SHORT_TIMEOUT = max(1, int(args.timeout))
 
-    killer_startup_animation()
-    print(Fore.GREEN + f"\n[CFG] Workers={MAX_WORKERS}, RateLimit={RATE_LIMIT}s, ShortTimeout={SHORT_TIMEOUT}s" + Style.RESET_ALL)
+    startup_animation()
+    print(Fore.GREEN + f"[CFG] workers={MAX_WORKERS}, rate_limit={RATE_LIMIT}s, timeout={SHORT_TIMEOUT}s" + Style.RESET_ALL)
     print(Fore.GREEN + "\n[MODE] 1 = Scan 1 domain | 2 = Multi scan (bulk.txt)\n" + Style.RESET_ALL)
     mode = input("Pilih mode (1/2): ").strip()
-    if mode == '2':
+    if mode == "2":
         filepath = input("Masukkan path file list domain (contoh: targets.txt): ").strip()
         if not os.path.exists(filepath):
             print(Fore.RED + "[!] File tidak ditemukan." + Style.RESET_ALL)
             return
         with open(filepath) as f:
-            targets = [line.strip() for line in f if line.strip()]
-        for domain in targets:
-            scan_domain(domain)
+            targets = [l.strip() for l in f if l.strip()]
+        for t in targets:
+            scan_domain(t, MAX_WORKERS, RATE_LIMIT, SHORT_TIMEOUT)
     else:
         domain = input(Fore.YELLOW + "[>] Masukkan domain target: " + Style.RESET_ALL).strip()
-        scan_domain(domain)
-    print(Fore.CYAN + "\n[✓] Semua proses selesai. Hasil ada di folder output/." + Style.RESET_ALL)
+        scan_domain(domain, MAX_WORKERS, RATE_LIMIT, SHORT_TIMEOUT)
 
 if __name__ == "__main__":
     try:
