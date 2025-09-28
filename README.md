@@ -11,7 +11,7 @@ Only use this tool on targets where you have **explicit written authorization**.
 1. Create Python venv:
 ```bash
 sudo apt update && sudo apt install -y git
-git clone https://github.com/Zero-F0X/ZeroFox-V2.git
+git clone https://github.com/Zero-F0X/ZeroFox_V2.git
 pip install --upgrade pip
 pip install -r requirements.txt
 python -m playwright install chromium
