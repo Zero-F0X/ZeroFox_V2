@@ -1,92 +1,138 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# ZeroFox v2 - XSS detection improved with headless rendering (Playwright)
-# Original author: ZeroFox | Modifications: assistant
-# IMPORTANT: Use only on authorized targets.
+# ZeroFox v2 - Fast + Spooky UI
+# Use ONLY on authorized targets.
 
 import os
-import requests
+import sys
+import time
+import random
 import re
 import urllib.parse
-import time
 import subprocess
-import sys
-from colorama import Fore, Style
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+import requests
 import urllib3
-import random
-from tqdm import tqdm
+import threading
+from functools import partial
+import concurrent.futures
 
-urllib3.disable_warnings()
+# Third-party
+try:
+    from colorama import Fore, Back, Style, init as colorama_init
+    from bs4 import BeautifulSoup
+    from tqdm import tqdm
+except Exception as e:
+    print("Missing dependencies. Install with: pip install requests beautifulsoup4 colorama tqdm")
+    raise e
 
-# -------------------------
-# Configuration
-# -------------------------
-XSS_PAYLOAD_FILE = "xss.txt"
-RATE_LIMIT = 0.15            # seconds between requests
-REQUEST_TIMEOUT = 8          # HTTP request timeout
-SAVE_EVIDENCE = True         # save response HTML and screenshots
-HEADLESS_ENABLED = True      # try to use Playwright for headless detection
-PLAYWRIGHT_LAUNCH_OPTIONS = {"headless": True, "timeout": 15000}  # ms timeout for navigation
-
-# -------------------------
-# Try to import Playwright (optional)
-# -------------------------
+# Optional playwright
+HEADLESS_ENABLED = True
 _playwright_available = False
-
 if HEADLESS_ENABLED:
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
         _playwright_available = True
-        print(Fore.GREEN + "[i] Playwright available: headless checks enabled." + Style.RESET_ALL)
     except Exception:
         _playwright_available = False
-        print(Fore.YELLOW + "[!] Playwright not available. Headless detection DISABLED.")
-        print(Fore.YELLOW + "[!] To enable headless detection install:\n    pip install playwright\n    python -m playwright install chromium" + Style.RESET_ALL)
+
+colorama_init(autoreset=True)
+urllib3.disable_warnings()
 
 # -------------------------
-# UI / loading
+# CONFIG
 # -------------------------
-def loading(text="[~] Memuat..."):
-    print(Fore.CYAN + text + Style.RESET_ALL)
-    for _ in range(3):
-        for dot in [".", "..", "..."]:
-            sys.stdout.write(f"\r{text}{dot}   ")
-            sys.stdout.flush()
-            time.sleep(0.4)
-    print("\r" + " " * (len(text) + 10) + "\r", end="")
+XSS_PAYLOAD_FILE = "xss.txt"
+RATE_LIMIT = 0.12            # seconds between requests
+REQUEST_TIMEOUT = 8          # fallback timeout
+SHORT_TIMEOUT = 4            # faster initial check
+SAVE_EVIDENCE = True
+PLAYWRIGHT_LAUNCH_OPTIONS = {"headless": True, "timeout": 15000}
+MAX_WORKERS = 6              # tune this (4-12 typical)
+UI_UPDATE_INTERVAL = 0.05    # for spinner animations
 
-def matrix_loading(text="[~] Initializing ZeroFox v2..."):
+# -------------------------
+# Fancy UI elements (hacker-y)
+# -------------------------
+def clear_screen():
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+def slow_print(text, delay=0.01, end="\n"):
+    for ch in text:
+        sys.stdout.write(ch)
+        sys.stdout.flush()
+        time.sleep(delay)
+    sys.stdout.write(end)
+    sys.stdout.flush()
+
+def typing_effect(lines, w_delay=0.01, between=0.25):
+    for line in lines:
+        slow_print(line, delay=w_delay)
+        time.sleep(between)
+
+def big_banner():
+    banner = r"""
+ ████████╗███████╗███████╗ ██████╗  ██████╗ ██╗  ██╗██╗  ██╗
+ ╚══██╔══╝██╔════╝██╔════╝██╔═══██╗██╔═══██╗██║ ██╔╝██║  ██║
+    ██║   █████╗  ███████╗██║   ██║██║   ██║█████╔╝ ███████║
+    ██║   ██╔══╝  ╚════██║██║   ██║██║   ██║██╔═██╗ ██╔══██║
+    ██║   ███████╗███████║╚██████╔╝╚██████╔╝██║  ██╗██║  ██║
+    ╚═╝   ╚══════╝╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝
+    """
+    print(Fore.RED + Style.BRIGHT + banner + Style.RESET_ALL)
+    intro = [
+        Fore.LIGHTBLACK_EX + "ZeroFox v2" + Style.RESET_ALL + " — Http Recon & XSS Scanner (authorized use only).",
+        Fore.YELLOW + "Initializing modules..." + Style.RESET_ALL
+    ]
+    typing_effect(intro, w_delay=0.02, between=0.15)
+
+def spinner_task(stop_event, text="booting"):
+    chars = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+    i = 0
+    while not stop_event.is_set():
+        sys.stdout.write(f"\r{Fore.CYAN}[{chars[i%len(chars)]}] {text}{' ' * 20}{Style.RESET_ALL}")
+        sys.stdout.flush()
+        time.sleep(UI_UPDATE_INTERVAL)
+        i += 1
+    sys.stdout.write("\r" + " " * 80 + "\r")
+    sys.stdout.flush()
+
+def matrix_rain(lines=10, width=60, delay=0.02):
     charset = "01"
-    print(Fore.GREEN + text + Style.RESET_ALL)
-    for _ in range(8):
-        line = ''.join(random.choice(charset) for _ in range(40))
+    for _ in range(lines):
+        line = ''.join(random.choice(charset) for _ in range(width))
         print(Fore.GREEN + line + Style.RESET_ALL)
-        time.sleep(0.02)
+        time.sleep(delay)
 
-print(Fore.RED + Style.BRIGHT + """
-███████╗███████╗██████╗░░█████╗░███████╗░█████╗░██╗░░██╗
-╚════██║██╔════╝██╔══██╗██╔══██╗██╔════╝██╔══██╗╚██╗██╔╝
-░░███╔═╝█████╗░░██████╔╝██║░░██║█████╗░░██║░░██║░╚███╔╝░
-██╔══╝░░██╔══╝░░██╔══██╗██║░░██║██╔══╝░░██║░░██║░██╔██╗░
-███████╗███████╗██║░░██║╚█████╔╝██║░░░░░╚█████╔╝██╔╝╚██╗
-╚══════╝╚══════╝╚═╝░░╚═╝░╚════╝░╚═╝░░░░░░╚════╝░╚═╝░░╚═╝
-""" + Style.RESET_ALL)
+def spooky_console(lines=6, delay_between=0.18):
+    # fake logs that look scary but are non-destructive / harmless
+    templates = [
+        "[init] kernel modules loaded",
+        "[net] sniffing interfaces: eth0 wlan0",
+        "[auth] keys fetched from memory (simulated)",
+        "[scan] starting passive recon",
+        "[payload] queue prepared (non-destructive markers only)",
+        "[xss] headless engine primed"
+    ]
+    for i in range(lines):
+        line = templates[i % len(templates)]
+        slow_print(Fore.LIGHTBLACK_EX + line + Style.RESET_ALL, delay=0.01)
+        time.sleep(delay_between)
 
-matrix_loading()
+def killer_startup_animation():
+    clear_screen()
+    big_banner()
+    stop = threading.Event()
+    s = threading.Thread(target=spinner_task, args=(stop, "initializing subsystems..."))
+    s.start()
+    time.sleep(1.1)
+    stop.set()
+    s.join()
+    matrix_rain(lines=8, width=72, delay=0.02)
+    spooky_console(lines=6, delay_between=0.18)
+    print()
 
 # -------------------------
-# Example small password list (kept as-is)
-# -------------------------
-rockyou_mini = [
-    "123456", "password", "123456789", "12345678", "12345",
-    "admin", "letmein", "welcome", "qwerty", "abc123",
-    "1q2w3e4r", "passw0rd", "iloveyou", "123123", "dragon"
-]
-
-# -------------------------
-# Helpers
+# Helpers for scanning
 # -------------------------
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
@@ -98,22 +144,16 @@ def save_list(path, items):
         for it in items:
             f.write(it + "\n")
 
-# -------------------------
-# Payload loader
-# -------------------------
 def load_xss_payloads(path=XSS_PAYLOAD_FILE):
     if os.path.exists(path):
         with open(path, encoding="utf-8", errors="ignore") as f:
-            payloads = [line.rstrip("\\n") for line in f if line.strip()]
+            payloads = [line.rstrip("\n") for line in f if line.strip()]
         print(Fore.GREEN + f"[i] Loaded {len(payloads)} payload(s) from {path}." + Style.RESET_ALL)
         return payloads
     else:
-        print(Fore.RED + f"[!] Payload file {path} not found." + Style.RESET_ALL)
+        print(Fore.YELLOW + f"[!] {path} not found — no XSS payloads loaded." + Style.RESET_ALL)
         return []
 
-# -------------------------
-# Inject payload into query parameters
-# -------------------------
 def inject_payload(url, payload):
     try:
         base, params = url.split("?", 1)
@@ -122,15 +162,12 @@ def inject_payload(url, payload):
     except Exception:
         return url
 
-# -------------------------
-# Save evidence (HTML + screenshot)
-# -------------------------
 def save_evidence_html(outdir, safe_name, payload, resp_text):
     ev_dir = ensure_dir(os.path.join(outdir, "evidence"))
     fn = os.path.join(ev_dir, f"{safe_name}.html")
     try:
         with open(fn, "w", encoding="utf-8") as f:
-            f.write(f"<!-- payload: {payload} -->\\n")
+            f.write(f"<!-- payload: {payload} -->\n")
             f.write(resp_text)
     except Exception:
         pass
@@ -147,263 +184,203 @@ def save_screenshot(outdir, safe_name, image_bytes):
     return fn
 
 # -------------------------
-# Headless detection using Playwright
+# Headless reuse helper
 # -------------------------
-def play_authorized_check(test_url, marker, outdir, timeout=8000):
+def play_authorized_check_with_browser(browser, test_url, marker, outdir, timeout=8000):
     """
-    Return tuple (detected:bool, details:dict)
-    details may include: console_messages(list), screenshot_path, html_path
+    Reuse an existing Playwright browser instance to detect console logs/DOM markers.
+    Returns (detected: bool, details: dict)
     """
-    # if playwright not available, skip
-    try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-    except Exception:
-        return (False, {"reason": "playwright_unavailable"})
-
     details = {"console": [], "screenshot": None, "html": None}
-    safe_name = re.sub(r'[^0-9A-Za-z\\-_\\.]', '_', test_url)[:200] + "__" + str(int(time.time()))
     try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(**PLAYWRIGHT_LAUNCH_OPTIONS)
-            context = browser.new_context()
-            page = context.new_page()
+        context = browser.new_context()
+        page = context.new_page()
+        def on_console(msg):
+            try:
+                details["console"].append(msg.text())
+            except Exception:
+                pass
+        page.on("console", on_console)
+        try:
+            page.goto(test_url, wait_until="networkidle", timeout=timeout)
+        except Exception:
+            pass
+        try:
+            page.wait_for_timeout(200)
+        except Exception:
+            pass
 
-            # listen to console messages
-            def on_console(msg):
+        # console messages
+        for m in details["console"]:
+            if marker in m:
                 try:
-                    txt = msg.text()
-                    details["console"].append(txt)
+                    ss = page.screenshot(type="png")
+                    details["screenshot"] = save_screenshot(outdir, re.sub(r'[^0-9A-Za-z\-_\.]', '_', test_url)[:200], ss)
+                    html = page.content()
+                    details["html"] = save_evidence_html(outdir, re.sub(r'[^0-9A-Za-z\-_\.]', '_', test_url)[:200] + "_rendered", marker, html)
                 except Exception:
                     pass
-            page.on("console", on_console)
-
-            # navigate (use try/catch to avoid hanging)
-            try:
-                page.goto(test_url, wait_until="networkidle", timeout=timeout)
-            except Exception:
-                pass
-
-            # short wait to allow onload
-            try:
-                page.wait_for_timeout(200)  # ms
-            except Exception:
-                pass
-
-            # check console messages for marker
-            for m in details["console"]:
-                if marker in m:
-                    # save screenshot + html
-                    try:
-                        ss = page.screenshot(type="png")
-                        details["screenshot"] = save_screenshot(outdir, safe_name, ss)
-                        html = page.content()
-                        details["html"] = save_evidence_html(outdir, safe_name + "_rendered", marker, html)
-                    except Exception:
-                        pass
+                try:
                     context.close()
-                    browser.close()
-                    return (True, details)
+                except:
+                    pass
+                return True, details
 
-            # If console didn't show, check DOM for marker text
-            try:
-                content = page.content()
-                if marker in content:
-                    details["html"] = save_evidence_html(outdir, safe_name + "_rendered", marker, content)
-                    try:
-                        ss = page.screenshot(type="png")
-                        details["screenshot"] = save_screenshot(outdir, safe_name, ss)
-                    except Exception:
-                        pass
+        # DOM check
+        try:
+            content = page.content()
+            if marker in content:
+                details["html"] = save_evidence_html(outdir, re.sub(r'[^0-9A-Za-z\-_\.]', '_', test_url)[:200] + "_rendered", marker, content)
+                try:
+                    ss = page.screenshot(type="png")
+                    details["screenshot"] = save_screenshot(outdir, re.sub(r'[^0-9A-Za-z\-_\.]', '_', test_url)[:200], ss)
+                except Exception:
+                    pass
+                try:
                     context.close()
-                    browser.close()
-                    return (True, details)
-            except Exception:
-                pass
+                except:
+                    pass
+                return True, details
+        except Exception:
+            pass
 
+        try:
             context.close()
-            browser.close()
+        except:
+            pass
     except Exception as e:
-        return (False, {"reason": f"playwright_error: {e}"})
-
-    return (False, details)
+        return False, {"reason": f"playwright_error:{e}"}
+    return False, details
 
 # -------------------------
-# XSS scanning improved
+# Optimized XSS scanning (parallel per-URL)
 # -------------------------
-def scan_xss(urls, outdir, payloads):
-    hits = []
-    if not payloads:
-        print(Fore.YELLOW + "[!] No XSS payloads loaded. Skipping XSS scan." + Style.RESET_ALL)
-        return hits
-
-    print(Fore.CYAN + f"[i] Starting XSS scan: {len(urls)} URLs, {len(payloads)} payloads." + Style.RESET_ALL)
-    for url in tqdm(urls, desc="[SCAN] XSS"):
-        if "?" not in url:
-            continue
-
+def _scan_url_worker(url, payloads, outdir, rate_limit, request_timeout, playwright_enabled, browser):
+    """
+    Worker scans one URL (all payloads sequentially). Returns first found test_url or None.
+    """
+    session = requests.Session()
+    session.headers.update({"User-Agent": "ZeroFox-v2-Scanner/1.0"})
+    try:
         for payload in payloads:
-            m = re.search(r"[A-Za-z0-9_]{6,}", payload)
-            if m:
-                marker = m.group(0)
-            else:
-                marker = "RECON_" + str(random.randint(100000, 999999))
-
             test_url = inject_payload(url, payload)
-
-            # 1) quick HTTP request
             try:
-                r = requests.get(test_url, timeout=REQUEST_TIMEOUT, verify=False)
+                r = session.get(test_url, timeout=request_timeout, verify=False)
                 resp = r.text or ""
                 decoded_payload = urllib.parse.unquote_plus(payload)
-                header_hit = False
-
-                if (payload in resp) or (decoded_payload in resp) or (marker in resp):
-                    print(Fore.RED + f"[XSS-REFLECT] {test_url}" + Style.RESET_ALL)
-                    hits.append(test_url)
+                # quick reflection detection
+                if payload in resp or decoded_payload in resp:
+                    safe = re.sub(r'[^0-9A-Za-z\-_\.]', '_', test_url)[:200]
                     if SAVE_EVIDENCE:
-                        safe = re.sub(r'[^0-9A-Za-z\\-_\\.]', '_', test_url)[:200]
                         save_evidence_html(outdir, safe + "__resp", payload, resp)
-                    break
-
+                    return test_url
+                # headers check
                 for hk, hv in r.headers.items():
-                    if payload in hv or decoded_payload in hv or marker in hv:
-                        header_hit = True
-                        print(Fore.RED + f"[XSS-HEADER] {test_url} (header: {hk})" + Style.RESET_ALL)
-                        hits.append(test_url)
+                    if payload in hv or decoded_payload in hv:
+                        safe = re.sub(r'[^0-9A-Za-z\-_\.]', '_', test_url)[:200]
                         if SAVE_EVIDENCE:
-                            safe = re.sub(r'[^0-9A-Za-z\\-_\\.]', '_', test_url)[:200]
-                            save_evidence_html(outdir, safe + "__header", payload, f"{hk}: {hv}\\n\\n{resp}")
-                        break
-                if header_hit:
-                    break
-
+                            save_evidence_html(outdir, safe + "__header", payload, f"{hk}: {hv}\n\n{resp}")
+                        return test_url
             except Exception:
-                resp = ""
                 pass
             finally:
-                if RATE_LIMIT:
-                    time.sleep(RATE_LIMIT)
+                if rate_limit:
+                    time.sleep(rate_limit)
 
-            # 3) headless
-            detected, details = play_authorized_check(test_url, marker, outdir)
-            if detected:
-                print(Fore.RED + f"[XSS-HEADLESS] {test_url} (marker: {marker})" + Style.RESET_ALL)
-                hits.append(test_url)
-                if SAVE_EVIDENCE:
-                    repfn = os.path.join(outdir, "evidence", re.sub(r'[^0-9A-Za-z\\-_\\.]', '_', test_url)[:200] + "__report.txt")
-                    try:
-                        ensure_dir(os.path.dirname(repfn))
-                        with open(repfn, "w", encoding="utf-8") as rf:
-                            rf.write(f"URL: {test_url}\\nMARKER: {marker}\\nDETAILS:\\n{repr(details)}\\n")
-                    except Exception:
-                        pass
-                break
+        # fallback headless detect
+        if playwright_enabled and browser:
+            marker_m = re.search(r"[A-Za-z0-9_]{6,}", payload)
+            if marker_m:
+                marker = marker_m.group(0)
+            else:
+                marker = "ZF" + str(random.randint(100000, 999999))
+            try:
+                detected, details = play_authorized_check_with_browser(browser, test_url, marker, outdir)
+                if detected:
+                    return test_url
+            except Exception:
+                pass
+    finally:
+        try:
+            session.close()
+        except:
+            pass
+    return None
+
+def optimized_scan_xss(urls, outdir, payloads):
+    hits = []
+    if not payloads:
+        print(Fore.YELLOW + "[!] No payloads loaded, skipping XSS scan." + Style.RESET_ALL)
+        return hits
+
+    print(Fore.CYAN + f"[i] Starting optimized XSS scan: {len([u for u in urls if '?' in u])} parameterized URL(s), {len(payloads)} payload(s), workers={MAX_WORKERS}." + Style.RESET_ALL)
+
+    # prepare playwright once
+    browser = None
+    pw_controller = None
+    if _playwright_available:
+        try:
+            pw_controller = sync_playwright().start()
+            browser = pw_controller.chromium.launch(**PLAYWRIGHT_LAUNCH_OPTIONS)
+            print(Fore.CYAN + "[i] Playwright browser launched for reuse." + Style.RESET_ALL)
+        except Exception as e:
+            browser = None
+            try:
+                if pw_controller:
+                    pw_controller.stop()
+            except:
+                pass
+            print(Fore.YELLOW + f"[!] Playwright launch failed: {e}" + Style.RESET_ALL)
+
+    target_urls = [u for u in urls if "?" in u]
+    if not target_urls:
+        print(Fore.YELLOW + "[!] No parameterized URLs to scan." + Style.RESET_ALL)
+        return hits
+
+    workers = min(MAX_WORKERS, max(1, len(target_urls)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        func = partial(_scan_url_worker, payloads=payloads, outdir=outdir, rate_limit=RATE_LIMIT,
+                       request_timeout=SHORT_TIMEOUT, playwright_enabled=bool(browser), browser=browser)
+        future_to_url = {ex.submit(func, url): url for url in target_urls}
+        # nice progress reporting
+        for future in concurrent.futures.as_completed(future_to_url):
+            url = future_to_url[future]
+            try:
+                res = future.result()
+                if res:
+                    print(Fore.RED + f"[FOUND] {res}" + Style.RESET_ALL)
+                    hits.append(res)
+                else:
+                    # friendly small console output
+                    print(Fore.LIGHTBLACK_EX + f"[OK] {url} scanned." + Style.RESET_ALL)
+            except Exception as e:
+                print(Fore.YELLOW + f"[!] Worker error for {url}: {e}" + Style.RESET_ALL)
+
+    # cleanup browser
+    if browser:
+        try:
+            browser.close()
+        except:
+            pass
+        try:
+            pw_controller.stop()
+        except:
+            pass
 
     hits = sorted(set(hits))
     save_list(os.path.join(outdir, "xss_found_urls.txt"), hits)
     return hits
 
 # -------------------------
-# Generic scans (kept minimal)
-# -------------------------
-def scan_generic(urls, name, payload, detect_func, outdir, filename):
-    hits = []
-    for url in tqdm(urls, desc=f"[SCAN] {name}"):
-        if "?" in url:
-            test = inject_payload(url, payload)
-            try:
-                r = requests.get(test, timeout=REQUEST_TIMEOUT, verify=False)
-                if detect_func(r):
-                    print(Fore.RED + f"[{name}] {test}" + Style.RESET_ALL)
-                    hits.append(test)
-            except Exception:
-                pass
-            finally:
-                if RATE_LIMIT:
-                    time.sleep(RATE_LIMIT)
-    save_list(os.path.join(outdir, filename), hits)
-
-def scan_uploads(urls, outdir):
-    hits = []
-    for url in urls:
-        try:
-            r = requests.get(url, timeout=REQUEST_TIMEOUT, verify=False)
-            if any(x in r.text.lower() for x in ["upload", "file", "browse"]):
-                print(Fore.RED + f"[UPLOAD] {url}" + Style.RESET_ALL)
-                hits.append(url)
-        except Exception:
-            pass
-        finally:
-            if RATE_LIMIT:
-                time.sleep(RATE_LIMIT)
-    save_list(os.path.join(outdir, "upload_panels.txt"), hits)
-
-def scan_sensitive_files(domain, outdir):
-    sensitive = ["/.env", "/.git/config", "/phpinfo.php", "/config.php"]
-    hits = []
-    for path in sensitive:
-        url = f"http://{domain}{path}"
-        try:
-            r = requests.get(url, timeout=REQUEST_TIMEOUT, verify=False)
-            if r.status_code == 200:
-                print(Fore.RED + f"[SENSITIVE] {url}" + Style.RESET_ALL)
-                hits.append(url)
-        except Exception:
-            pass
-        finally:
-            if RATE_LIMIT:
-                time.sleep(RATE_LIMIT)
-    save_list(os.path.join(outdir, "sensitive_files.txt"), hits)
-
-def scan_nuclei(outdir):
-    urls_path = os.path.join(outdir, "crawled_urls.txt")
-    output_file = os.path.join(outdir, "nuclei_result.txt")
-    if os.path.exists(urls_path):
-        loading("[*] Menjalankan Nuclei")
-        try:
-            subprocess.run(["nuclei", "-l", urls_path, "-o", output_file, "-silent"], timeout=300)
-        except Exception as e:
-            print(Fore.RED + f"[!] Nuclei gagal: {e}" + Style.RESET_ALL)
-
-def scan_dalfox(outdir):
-    urls_path = os.path.join(outdir, "crawled_urls.txt")
-    output_file = os.path.join(outdir, "dalfox_result.txt")
-    if os.path.exists(urls_path):
-        loading("[*] Menjalankan Dalfox")
-        try:
-            subprocess.run(["dalfox", "file", urls_path, "--output", output_file], timeout=300)
-        except Exception as e:
-            print(Fore.RED + f"[!] Dalfox gagal: {e}" + Style.RESET_ALL)
-
-# -------------------------
-# Brute force (use only with permission)
-# -------------------------
-def brute_force_login(url, user_field, pass_field, outdir):
-    for u in ["admin", "root"]:
-        for p in rockyou_mini:
-            try:
-                r = requests.post(url, data={user_field: u, pass_field: p}, timeout=REQUEST_TIMEOUT, allow_redirects=False)
-                if r.status_code in [200, 302] and "incorrect" not in r.text.lower():
-                    print(Fore.RED + f"[FOUND] {u}:{p}" + Style.RESET_ALL)
-                    with open(f"{outdir}/brute_success.txt", "a", encoding="utf-8") as f:
-                        f.write(f"{u}:{p}\n")
-                    return
-            except Exception:
-                continue
-            finally:
-                if RATE_LIMIT:
-                    time.sleep(RATE_LIMIT)
-
-# -------------------------
-# Crawl & orchestrate
+# Other scans (kept simple)
 # -------------------------
 def find_subdomains(domain, outdir):
     try:
         r = requests.get(f"https://crt.sh/?q=%25.{domain}&output=json", timeout=10)
         data = r.json()
-        subdomains = sorted(set(entry['name_value'] for entry in data if domain in entry['name_value']))
-        save_list(os.path.join(outdir, "subdomains.txt"), subdomains)
-        return subdomains
+        subs = sorted(set(entry['name_value'] for entry in data if domain in entry['name_value']))
+        save_list(os.path.join(outdir, "subdomains.txt"), subs)
+        return subs
     except Exception:
         return []
 
@@ -415,16 +392,6 @@ def find_urls(domain, outdir):
         return urls
     except Exception:
         return []
-
-def extract_parameters(urls, outdir):
-    params = set()
-    for url in urls:
-        if "?" in url:
-            query = urllib.parse.urlparse(url).query
-            for p in urllib.parse.parse_qs(query).keys():
-                params.add(p)
-    save_list(os.path.join(outdir, "parameters.txt"), sorted(params))
-    print(Fore.GREEN + f"[i] Parameter ditemukan: {len(params)} (disimpan di parameters.txt)" + Style.RESET_ALL)
 
 def crawl_site(start_url, outdir, max_depth=2):
     domain = urllib.parse.urlparse(start_url).netloc
@@ -448,59 +415,52 @@ def crawl_site(start_url, outdir, max_depth=2):
     save_list(os.path.join(outdir, "crawled_urls.txt"), sorted(set(found)))
     return found
 
+# -------------------------
+# Top-level flows (simplified)
+# -------------------------
 def scan_all(urls, domain):
     outdir = f"output/{domain}"
     ensure_dir(outdir)
     payloads = load_xss_payloads(XSS_PAYLOAD_FILE)
-    scan_xss(urls, outdir, payloads)
-    scan_generic(urls, "SQLi", "' OR '1'='1", lambda r: re.search(r"(sql|mysql|syntax|error)", r.text, re.I), outdir, "sqli.txt")
-    scan_generic(urls, "LFI", "../../../../etc/passwd", lambda r: "root:x:" in r.text, outdir, "lfi.txt")
-    scan_generic(urls, "Redirect", "https://evil.com", lambda r: "evil.com" in r.headers.get("Location", ""), outdir, "redirect.txt")
-    scan_uploads(urls, outdir)
-    scan_sensitive_files(domain, outdir)
-    extract_parameters(urls, outdir)
-    scan_nuclei(outdir)
-    scan_dalfox(outdir)
+    # quick UI
+    print(Fore.MAGENTA + f"[+] Running XSS scan for {domain}..." + Style.RESET_ALL)
+    found = optimized_scan_xss(urls, outdir, payloads)
+    print(Fore.GREEN + f"[✓] XSS scan done — {len(found)} vulnerable endpoints found." + Style.RESET_ALL)
 
 def scan_domain(domain):
     outdir = f"output/{domain}"
-    loading(f"[~] Memulai scan domain {domain}")
-    subdomains = find_subdomains(domain, outdir)
+    ensure_dir(outdir)
+    print(Fore.CYAN + f"[~] Collecting URLs for {domain}..." + Style.RESET_ALL)
     wayback = find_urls(domain, outdir)
     crawled = crawl_site(f"http://{domain}", outdir)
     urls = list(set(wayback + crawled))
     save_list(os.path.join(outdir, "all_urls.txt"), urls)
     scan_all(urls, domain)
 
-def multi_target_scan():
-    filepath = input("Masukkan path file list domain (contoh: targets.txt): ").strip()
-    if not os.path.exists(filepath):
-        print(Fore.RED + "[!] File tidak ditemukan." + Style.RESET_ALL)
-        return
-    with open(filepath) as f:
-        targets = [line.strip() for line in f if line.strip()]
-    for domain in targets:
-        loading(f"[~] Scanning: {domain}")
-        scan_domain(domain)
-
-def single_target_mode():
-    domain = input(Fore.YELLOW + "[>] Masukkan domain target: " + Style.RESET_ALL).strip()
-    scan_domain(domain)
-    brute = input("Brute force login? (y/n): ").strip().lower()
-    if brute == 'y':
-        url = input("Login URL: ").strip()
-        user_field = input("Field username: ").strip()
-        pass_field = input("Field password: ").strip()
-        brute_force_login(url, user_field, pass_field, f"output/{domain}")
-
 # -------------------------
-# Entrypoint
+# Entry/CLI
 # -------------------------
-if __name__ == "__main__":
-    print(Fore.GREEN + "\\n[MODE] 1 = Scan 1 domain | 2 = Multi scan (bulk.txt)\\n" + Style.RESET_ALL)
+def main():
+    killer_startup_animation()
+    print(Fore.GREEN + "\n[MODE] 1 = Scan 1 domain | 2 = Multi scan (bulk.txt)\n" + Style.RESET_ALL)
     mode = input("Pilih mode (1/2): ").strip()
     if mode == '2':
-        multi_target_scan()
+        filepath = input("Masukkan path file list domain (contoh: targets.txt): ").strip()
+        if not os.path.exists(filepath):
+            print(Fore.RED + "[!] File tidak ditemukan." + Style.RESET_ALL)
+            return
+        with open(filepath) as f:
+            targets = [line.strip() for line in f if line.strip()]
+        for domain in targets:
+            print(Fore.CYAN + f"[~] Scanning: {domain}" + Style.RESET_ALL)
+            scan_domain(domain)
     else:
-        single_target_mode()
-    print(Fore.CYAN + "\\n[✓] Scan selesai. Hasil disimpan di folder output/." + Style.RESET_ALL)
+        domain = input(Fore.YELLOW + "[>] Masukkan domain target: " + Style.RESET_ALL).strip()
+        scan_domain(domain)
+    print(Fore.CYAN + "\n[✓] Semua proses selesai. Hasil ada di folder output/." + Style.RESET_ALL)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(Fore.RED + "\n[!] Dibatalkan oleh user." + Style.RESET_ALL)
