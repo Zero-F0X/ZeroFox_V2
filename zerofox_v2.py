@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# ZeroFox v2 - Fast + Spooky UI
+# ZeroFox v2 - Fast + Spooky UI (with scary scan animation)
 # Use ONLY on authorized targets.
 
 import os
@@ -255,7 +255,67 @@ def play_authorized_check_with_browser(browser, test_url, marker, outdir, timeou
     return False, details
 
 # -------------------------
-# Optimized XSS scanning (parallel per-URL)
+# Scan animation thread (scary)
+# -------------------------
+def _scan_progress_anim(stop_event, counters, total_urls):
+    """
+    counters: dict with keys 'scanned' and 'found'
+    total_urls: int
+    This function runs in a thread and prints a scary/professional animated status.
+    """
+    skull = [
+        "      .-''''-.",
+        "     /  .--.  \\",
+        "    /  /    \\  \\",
+        "    |  |    |  |",
+        "    \\  \\    /  /",
+        "     '._`--' _.'",
+        "        `----`"
+    ]
+    spinner = ["⣾","⣷","⣯","⣟","⡿","⢿","⣻","⣽"]
+    matrix_cols = 12
+    width = 60
+    i = 0
+    while not stop_event.is_set():
+        scanned = counters.get('scanned', 0)
+        found = counters.get('found', 0)
+        pct = int((scanned / total_urls) * 100) if total_urls else 0
+        bar_len = 30
+        filled = int((pct/100) * bar_len)
+        bar = ("█" * filled) + ("-" * (bar_len - filled))
+        spin = spinner[i % len(spinner)]
+        # matrix-like snippet
+        matrix_lines = []
+        for _ in range(3):
+            row = "".join(random.choice("01 ") for _ in range(20))
+            matrix_lines.append(row)
+        # print block
+        sys.stdout.write("\x1b[2J\x1b[H")  # clear screen and go home (terminal-safe)
+        # Header
+        sys.stdout.write(Fore.MAGENTA + Style.BRIGHT + " ZeroFox v2 — SCAN STATUS\n" + Style.RESET_ALL)
+        sys.stdout.write(Fore.CYAN + f" [{spin}] Scanning... {scanned}/{total_urls} URLs  |  Found: {found}\n" + Style.RESET_ALL)
+        sys.stdout.write(Fore.RED + f" Progress: [{bar}] {pct}%\n" + Style.RESET_ALL)
+        # skull (centered)
+        for idx, line in enumerate(skull):
+            if idx == 1:
+                sys.stdout.write(Fore.YELLOW + line.center(width) + Style.RESET_ALL + "\n")
+            else:
+                sys.stdout.write(Fore.LIGHTBLACK_EX + line.center(width) + Style.RESET_ALL + "\n")
+        sys.stdout.write("\n")
+        # matrix snippet
+        for ml in matrix_lines:
+            sys.stdout.write(Fore.GREEN + ml + Style.RESET_ALL + "\n")
+        sys.stdout.write("\n")
+        sys.stdout.write(Fore.LIGHTBLACK_EX + " Tip: Press Ctrl+C to abort scanning safely.\n" + Style.RESET_ALL)
+        sys.stdout.flush()
+        time.sleep(UI_UPDATE_INTERVAL * 8)
+        i += 1
+    # clear animation after stop
+    sys.stdout.write("\x1b[2J\x1b[H")
+    sys.stdout.flush()
+
+# -------------------------
+# Optimized XSS scanning (parallel per-URL) with animation
 # -------------------------
 def _scan_url_worker(url, payloads, outdir, rate_limit, request_timeout, playwright_enabled, browser):
     """
@@ -315,7 +375,9 @@ def optimized_scan_xss(urls, outdir, payloads):
         print(Fore.YELLOW + "[!] No payloads loaded, skipping XSS scan." + Style.RESET_ALL)
         return hits
 
-    print(Fore.CYAN + f"[i] Starting optimized XSS scan: {len([u for u in urls if '?' in u])} parameterized URL(s), {len(payloads)} payload(s), workers={MAX_WORKERS}." + Style.RESET_ALL)
+    target_urls = [u for u in urls if "?" in u]
+    total_urls = len(target_urls)
+    print(Fore.CYAN + f"[i] Starting optimized XSS scan: {total_urls} parameterized URL(s), {len(payloads)} payload(s), workers={MAX_WORKERS}." + Style.RESET_ALL)
 
     # prepare playwright once
     browser = None
@@ -334,29 +396,48 @@ def optimized_scan_xss(urls, outdir, payloads):
                 pass
             print(Fore.YELLOW + f"[!] Playwright launch failed: {e}" + Style.RESET_ALL)
 
-    target_urls = [u for u in urls if "?" in u]
     if not target_urls:
         print(Fore.YELLOW + "[!] No parameterized URLs to scan." + Style.RESET_ALL)
         return hits
+
+    # animation counters shared dict
+    counters = {'scanned': 0, 'found': 0}
+    stop_anim = threading.Event()
+    anim_thread = threading.Thread(target=_scan_progress_anim, args=(stop_anim, counters, total_urls), daemon=True)
+    anim_thread.start()
 
     workers = min(MAX_WORKERS, max(1, len(target_urls)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         func = partial(_scan_url_worker, payloads=payloads, outdir=outdir, rate_limit=RATE_LIMIT,
                        request_timeout=SHORT_TIMEOUT, playwright_enabled=bool(browser), browser=browser)
         future_to_url = {ex.submit(func, url): url for url in target_urls}
-        # nice progress reporting
-        for future in concurrent.futures.as_completed(future_to_url):
-            url = future_to_url[future]
-            try:
-                res = future.result()
-                if res:
-                    print(Fore.RED + f"[FOUND] {res}" + Style.RESET_ALL)
-                    hits.append(res)
-                else:
-                    # friendly small console output
-                    print(Fore.LIGHTBLACK_EX + f"[OK] {url} scanned." + Style.RESET_ALL)
-            except Exception as e:
-                print(Fore.YELLOW + f"[!] Worker error for {url}: {e}" + Style.RESET_ALL)
+        # iterate as they complete
+        try:
+            for future in concurrent.futures.as_completed(future_to_url):
+                url = future_to_url[future]
+                try:
+                    res = future.result()
+                    counters['scanned'] += 1
+                    if res:
+                        counters['found'] += 1
+                        # print small notification in a safe area (animation covers screen)
+                        hits.append(res)
+                    # avoid flooding stdout; animation shows progress
+                except Exception as e:
+                    counters['scanned'] += 1
+                    # log error to file to not break animation
+                    with open("scan_errors.log", "a", encoding="utf-8") as ef:
+                        ef.write(f"{time.asctime()} - error scanning {url}: {e}\n")
+        except KeyboardInterrupt:
+            print(Fore.RED + "\n[!] User requested abort. Waiting for workers to finish..." + Style.RESET_ALL)
+            # let executor finish current tasks then cancel
+            # not force-killing here to allow graceful cleanup
+            # Note: futures will continue until complete in this simple implementation
+            pass
+
+    # stop animation
+    stop_anim.set()
+    anim_thread.join()
 
     # cleanup browser
     if browser:
@@ -371,6 +452,8 @@ def optimized_scan_xss(urls, outdir, payloads):
 
     hits = sorted(set(hits))
     save_list(os.path.join(outdir, "xss_found_urls.txt"), hits)
+    # final summary (print after clearing animation)
+    print(Fore.GREEN + f"[✓] Scan finished. {len(hits)} vulnerable endpoints found. Results in {outdir}/xss_found_urls.txt" + Style.RESET_ALL)
     return hits
 
 # -------------------------
@@ -427,7 +510,7 @@ def scan_all(urls, domain):
     # quick UI
     print(Fore.MAGENTA + f"[+] Running XSS scan for {domain}..." + Style.RESET_ALL)
     found = optimized_scan_xss(urls, outdir, payloads)
-    print(Fore.GREEN + f"[✓] XSS scan done — {len(found)} vulnerable endpoints found." + Style.RESET_ALL)
+    # final summary already printed in optimized_scan_xss
 
 def scan_domain(domain):
     outdir = f"output/{domain}"
