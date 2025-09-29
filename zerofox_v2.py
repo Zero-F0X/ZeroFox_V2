@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xrayxss — XSS-focused scanner inspired by xray (chaitin/xray)
-Usage examples:
-  python xrayxss.py webscan --basic-crawler http://example.com --html-output vuln.html
-  python xrayxss.py webscan --basic-crawler example.com --workers 150 --proxies proxies.txt --playwright
-Only use on targets you are authorized to test.
+xrayxss_cli.py — xray-like XSS scanner (single-file)
+Use only on authorized targets.
+
+Subcommands:
+  webscan (alias xray webscan)  - like xray
+  scan                         - run full pipeline (wayback+crawl+scan)
+  crawl                        - just crawl + wayback gather
+  proxy-check                  - test proxies in proxies.txt and write proxies_good.txt
+  report                       - generate standalone HTML report from hits file
+
+Example:
+  python xrayxss_cli.py webscan --basic-crawler http://example.com --html-output vuln.html
+  python xrayxss_cli.py scan --targets example.com --workers 150 --proxies proxies.txt --outdir output --html vuln.html --playwright
 """
 
 import argparse
@@ -13,80 +21,67 @@ import asyncio
 import json
 import os
 import re
+import sys
 import time
 import urllib.parse
 from itertools import cycle
 from typing import List, Optional, Tuple, Dict, Set
 
-# Networking / HTTP
 import httpx
 import requests
 from bs4 import BeautifulSoup
-
-# File I/O async
 import aiofiles
 
-# Optional: Playwright verification (render + execute JS)
+# optional Playwright
 try:
     from playwright.async_api import async_playwright
     PLAYWRIGHT_AVAILABLE = True
 except Exception:
     PLAYWRIGHT_AVAILABLE = False
 
-# Terminal colors
+# optional colorama
 try:
     from colorama import Fore, Style, init as colorama_init
     colorama_init(autoreset=True)
 except Exception:
-    class _C:
+    class _C: 
         def __getattr__(self, k): return ""
     Fore = Style = _C()
 
-# -------------------------
-# Defaults / configuration
-# -------------------------
-SMOKE_PAYLOADS = [
+# ---------------------
+# Defaults & tuning
+# ---------------------
+SMOKE_DEFAULT = [
     "<script>alert(1)</script>",
-    "\"><script>alert(1)</script>",
+    '"><script>alert(1)</script>',
     "<img src=x onerror=alert(1)>",
     "<svg/onload=alert(1)>",
-    "'';!--\"<XSS>=&{}"
 ]
-# If user has large payload file, point XSS_PAYLOAD_FILE to it
 XSS_PAYLOAD_FILE = "xss.txt"
-SMOKE_COUNT = 30
 OUTDIR_DEFAULT = "output_xrayxss"
+DEFAULT_TEMPLATE = "dashboard_template.html"
 CONCURRENCY_DEFAULT = 150
 RATE_LIMIT_PER_HOST = 0.02
 GLOBAL_RPS = 400
 REQUEST_TIMEOUT = 8.0
 SAVE_EVIDENCE = True
-BATCH_EVIDENCE_FLUSH = 20
 
-# HTML dashboard template (your template inserted here, trimmed a bit)
-# We'll use the user's template exactly as previously provided but insert a receiveReport function.
-# For brevity in this code block we generate a minimal wrapper that loads a template file if present.
-DEFAULT_TEMPLATE = "dashboard_template.html"  # if exists, we'll use; otherwise generate a simple one
-
-# -------------------------
-# Utilities
-# -------------------------
-def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
-    return path
-
+# ---------------------
+# small helpers
+# ---------------------
+def ensure_dir(p): os.makedirs(p, exist_ok=True); return p
 def safe_name_for_file(s: str) -> str:
-    return re.sub(r'[^0-9A-Za-z\-_\.]', '_', s)[:200]
-
+    return re.sub(r'[^0-9A-Za-z\-_\.]', '_', s)[:220]
 def load_payloads(path: str) -> List[str]:
     if os.path.exists(path):
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            lines = [l.strip() for l in f if l.strip()]
-        return lines
+        with open(path, encoding='utf-8', errors='ignore') as f:
+            return [l.strip() for l in f if l.strip()]
     return []
 
+# ---------------------
+# inject payload into query string (all params)
+# ---------------------
 def inject_payload(url: str, payload: str) -> str:
-    """Place payload into every parameter value of query string."""
     if "?" not in url:
         return url
     base, qs = url.split("?", 1)
@@ -99,58 +94,24 @@ def inject_payload(url: str, payload: str) -> str:
             parts.append(f"{p}={urllib.parse.quote(payload)}")
     return f"{base}?{'&'.join(parts)}"
 
-def extract_param_urls_from_html(text: str, base_url: str) -> List[str]:
-    """Find links / forms with query parameters in page HTML."""
-    out = []
-    try:
-        soup = BeautifulSoup(text, "html.parser")
-        # anchors
-        for a in soup.find_all("a", href=True):
-            href = a['href']
-            full = urllib.parse.urljoin(base_url, href)
-            if "?" in full or "=" in full:
-                out.append(full)
-        # forms (action with inputs)
-        for f in soup.find_all("form", action=True):
-            act = urllib.parse.urljoin(base_url, f['action'])
-            # if action contains query params, add; else if inputs exist, add a dummy param
-            if "?" in act or "=" in act:
-                out.append(act)
-            else:
-                # attempt to build parameterized URL from input names (quick heuristic)
-                inputs = [inp.get("name") for inp in f.find_all("input", attrs={"name": True})]
-                if inputs:
-                    qs = "&".join(f"{name}=1" for name in inputs)
-                    out.append(act + ("?" + qs if "?" not in act else "&" + qs))
-    except Exception:
-        pass
-    return out
-
-# -------------------------
-# Wayback + crawling
-# -------------------------
+# ---------------------
+# Wayback + crawler
+# ---------------------
 def load_wayback(domain: str, limit: int = 500) -> List[str]:
-    """Fetch list of archived URLs from Wayback Machine (best-effort)."""
     out = []
     try:
         q = urllib.parse.quote(f"*.{domain}/*")
         url = f"http://web.archive.org/cdx/search/cdx?url={q}&output=json&fl=original&collapse=urlkey&limit={limit}"
-        headers = {"User-Agent": "xrayxss/1.0"}
-        resp = requests.get(url, timeout=12, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
+        r = requests.get(url, timeout=12, headers={"User-Agent":"xrayxss/1.0"})
+        r.raise_for_status()
+        data = r.json()
         for item in data[1:]:
-            # item might be list or string
-            if isinstance(item, list):
-                candidate = item[0]
-            else:
-                candidate = item
-            if candidate and candidate not in out:
-                out.append(candidate)
+            cand = item[0] if isinstance(item, list) else item
+            if cand and cand not in out:
+                out.append(cand)
             if len(out) >= limit:
                 break
     except Exception:
-        # fallback to text mode
         try:
             url2 = f"http://web.archive.org/cdx/search/cdx?url=*.{domain}/*&output=text&fl=original&collapse=urlkey&limit={limit}"
             r2 = requests.get(url2, timeout=12, headers={"User-Agent":"xrayxss/1.0"})
@@ -163,6 +124,27 @@ def load_wayback(domain: str, limit: int = 500) -> List[str]:
                         break
         except Exception:
             print(Fore.YELLOW + f"[!] Wayback fetch failed for {domain}" + Style.RESET_ALL)
+    return out
+
+def extract_param_urls_from_html(text: str, base_url: str) -> List[str]:
+    out = []
+    try:
+        soup = BeautifulSoup(text, "html.parser")
+        for a in soup.find_all("a", href=True):
+            full = urllib.parse.urljoin(base_url, a['href'])
+            if "?" in full or "=" in full:
+                out.append(full)
+        for form in soup.find_all("form", action=True):
+            act = urllib.parse.urljoin(base_url, form['action'])
+            if "?" in act or "=" in act:
+                out.append(act)
+            else:
+                inputs = [i.get("name") for i in form.find_all("input", attrs={"name": True})]
+                if inputs:
+                    qs = "&".join(f"{n}=1" for n in inputs)
+                    out.append(act + ("?" + qs if "?" not in act else "&" + qs))
+    except Exception:
+        pass
     return out
 
 def crawl_site(start_url: str, max_depth: int = 1, max_pages: int = 200) -> List[str]:
@@ -179,7 +161,6 @@ def crawl_site(start_url: str, max_depth: int = 1, max_pages: int = 200) -> List
             for u in extract_param_urls_from_html(r.text or "", url):
                 if domain in urllib.parse.urlparse(u).netloc and u not in visited:
                     found.append(u)
-            # enqueue links
             soup = BeautifulSoup(r.text or "", "html.parser")
             for link in soup.find_all("a", href=True):
                 full = urljoin(url, link['href'])
@@ -189,9 +170,9 @@ def crawl_site(start_url: str, max_depth: int = 1, max_pages: int = 200) -> List
             continue
     return sorted(set(found))
 
-# -------------------------
-# Async scanning primitives
-# -------------------------
+# ---------------------
+# rate limiters + httpx helpers
+# ---------------------
 class HostRateLimiter:
     def __init__(self, min_delay: float):
         self.min_delay = min_delay
@@ -199,24 +180,18 @@ class HostRateLimiter:
         self._lock = asyncio.Lock()
     async def wait(self, host: str):
         async with self._lock:
-            now = time.monotonic()
-            last = self._last.get(host, 0.0)
+            now = time.monotonic(); last = self._last.get(host, 0.0)
             wait_for = self.min_delay - (now - last)
-            if wait_for > 0:
-                await asyncio.sleep(wait_for)
+            if wait_for > 0: await asyncio.sleep(wait_for)
             self._last[host] = time.monotonic()
 
 class GlobalRateLimiter:
     def __init__(self, rps: int):
-        self._interval = 1.0 / max(1, rps)
-        self._lock = asyncio.Lock()
-        self._last = 0.0
+        self._interval = 1.0 / max(1, rps); self._lock = asyncio.Lock(); self._last = 0.0
     async def wait(self):
         async with self._lock:
-            now = time.monotonic()
-            elapsed = now - self._last
-            if elapsed < self._interval:
-                await asyncio.sleep(self._interval - elapsed)
+            now = time.monotonic(); elapsed = now - self._last
+            if elapsed < self._interval: await asyncio.sleep(self._interval - elapsed)
             self._last = time.monotonic()
 
 async def fetch_text(client: httpx.AsyncClient, url: str, timeout: float) -> Optional[str]:
@@ -230,8 +205,7 @@ async def test_payloads_on_url(client: httpx.AsyncClient, url: str, payloads: Li
     for p in payloads:
         test = inject_payload(url, p)
         text = await fetch_text(client, test, timeout)
-        if text is None:
-            continue
+        if text is None: continue
         dec = urllib.parse.unquote_plus(p)
         if p in text or dec in text:
             return (test, p, text)
@@ -248,78 +222,80 @@ def make_session_factory(proxies_cycle: Optional[cycle], verify_tls: bool, limit
         return client
     return factory
 
-# -------------------------
-# Playwright verification (optional)
-# -------------------------
+# ---------------------
+# Playwright verification
+# ---------------------
 async def playwright_verify(url: str, payload: str, timeout=12.0) -> bool:
-    if not PLAYWRIGHT_AVAILABLE:
-        return False
+    if not PLAYWRIGHT_AVAILABLE: return False
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
             await page.goto(url, timeout=timeout*1000)
-            # wait a short while to allow JS to run
             await asyncio.sleep(1.0)
-            # check for alert presence? Playwright cannot capture native alerts easily without handlers;
-            # instead, we check if payload string appears in page content / innerHTML
             content = await page.content()
             await browser.close()
             return payload in content
     except Exception:
         return False
 
-# -------------------------
-# Live dashboard (append <script>call to template)
-# -------------------------
-async def write_dashboard_initial(outdir: str, html_filename: str, use_template_path: Optional[str]=None):
+# ---------------------
+# Dashboard helpers (inject receiveReport into template)
+# ---------------------
+async def write_dashboard_initial(outdir: str, html_filename: str, template_path: Optional[str]=None):
     ensure_dir(outdir)
     path = os.path.join(outdir, html_filename)
-    if use_template_path and os.path.exists(use_template_path):
-        # read user-supplied template and inject receiveReport function if not present
-        with open(use_template_path, "r", encoding="utf-8", errors="ignore") as f:
+    if template_path and os.path.exists(template_path):
+        with open(template_path, "r", encoding="utf-8", errors="ignore") as f:
             tpl = f.read()
         if "function receiveReport" not in tpl:
-            # append a small receiveReport if not present
             insert = """
 <script>
 function receiveReport(obj){
   try{
-    // attempt to reuse existing 'sample' & render functions if present
     if(typeof receiveReportFallback === 'function'){ receiveReportFallback(obj); return; }
-    // fallback: append a row to reports table (minimal)
     const t = document.getElementById('reports');
     if(t){
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td>-</td><td title="${obj.url}">${obj.url}</td><td><code>${(obj.payload||'')}</code></td><td><span class='tag vuln'>${obj.status||'vulnerable'}</span></td><td>${obj.ts||''}</td><td><button class='btn ghost' onclick='alert(\\\"Open evidence manually\\\")'>Open</button></td>`;
+      tr.innerHTML = `<td>-</td><td title=\"${obj.url}\">${obj.url}</td><td><code>${(obj.payload||'')}</code></td><td><span class='tag vuln'>${obj.status||'vulnerable'}</span></td><td>${obj.ts||''}</td><td><a class='btn ghost' href='./evidence/${obj.safe || ''}__resp.html' target='_blank'>Open</a></td>`;
       t.prepend(tr);
     }
   }catch(e){console.error('receiveReport error',e)}
 }
 </script>
 </body>"""
-            # try to insert before closing body
             tpl = tpl.replace("</body>", insert)
         async with aiofiles.open(path, "w", encoding="utf-8") as f:
             await f.write(tpl)
     else:
-        # write a minimal report HTML if no template available
-        simple = f"""<!doctype html><html><head><meta charset=\"utf-8\"><title>xrayxss report</title></head><body><h1>xrayxss live report</h1><table><thead><tr><th>#</th><th>URL</th><th>Payload</th><th>Status</th><th>Timestamp</th></tr></thead><tbody id='reports'></tbody></table><script>function receiveReport(o){{const t=document.getElementById('reports');const tr=document.createElement('tr');tr.innerHTML=`<td>-</td><td>${{o.url}}</td><td><code>${{o.payload}}</code></td><td>${{o.status}}</td><td>${{o.ts}}</td>`;t.prepend(tr);}}</script></body></html>"""
+        simple = """<!doctype html><html><head><meta charset="utf-8"><title>xrayxss live</title></head><body><h1>xrayxss live</h1><table><thead><tr><th>#</th><th>URL</th><th>Payload</th><th>Status</th><th>Timestamp</th><th>Evidence</th></tr></thead><tbody id='reports'></tbody></table><script>function receiveReport(o){const t=document.getElementById('reports');const tr=document.createElement('tr');tr.innerHTML=`<td>-</td><td>${o.url}</td><td><code>${o.payload}</code></td><td>${o.status}</td><td>${o.ts}</td><td><a target='_blank' href='./evidence/${o.safe}__resp.html'>Open</a></td>`;t.prepend(tr);}</script></body></html>"""
         async with aiofiles.open(path, "w", encoding="utf-8") as f:
             await f.write(simple)
     return path
 
-async def append_to_dashboard(outdir: str, html_filename: str, url: str, payload: str, status: str='vulnerable'):
+async def append_to_dashboard(outdir: str, html_filename: str, url: str, payload: str, status: str='vulnerable', safe_name: str=""):
     path = os.path.join(outdir, html_filename)
     ts = time.strftime('%Y-%m-%d %H:%M:%S')
-    obj = {'url': url, 'payload': payload, 'status': status, 'ts': ts}
+    obj = {'url': url, 'payload': payload, 'status': status, 'ts': ts, 'safe': safe_name}
     js = f"<script>try{{ if(typeof receiveReport==='function') receiveReport({json.dumps(obj)}); else console.warn('no receiveReport'); }}catch(e){{console.error(e)}}</script>\n"
     async with aiofiles.open(path, "a", encoding="utf-8") as f:
         await f.write(js)
 
-# -------------------------
-# Orchestration: two-stage scan with live reporting
-# -------------------------
+# ---------------------
+# proxy health-check helper (sync simple)
+# ---------------------
+def proxy_health_check_sync(proxy: str, test_url="https://httpbin.org/ip", timeout=8.0):
+    try:
+        r = requests.get(test_url, proxies={"http": proxy, "https": proxy}, timeout=timeout)
+        if r.status_code == 200:
+            return True, r.text.strip()
+    except Exception as e:
+        return False, str(e)
+    return False, "unknown"
+
+# ---------------------
+# Orchestration
+# ---------------------
 async def worker_job(url: str, smoke_payloads: List[str], full_payloads: Optional[List[str]], session_factory, host_rl: HostRateLimiter, global_rl: GlobalRateLimiter, found_q: asyncio.Queue, timeout: float):
     parsed = urllib.parse.urlparse(url)
     host = parsed.netloc
@@ -327,14 +303,11 @@ async def worker_job(url: str, smoke_payloads: List[str], full_payloads: Optiona
     await global_rl.wait()
     client: httpx.AsyncClient = session_factory()
     try:
-        # smoke phase
         res = await test_payloads_on_url(client, url, smoke_payloads, timeout)
         if res:
             test_url, p, text = res
             await found_q.put((test_url, p, text, url))
-            # if full payloads provided: fuzz only this url
             if full_payloads:
-                # small sleep to avoid immediate bursts
                 await asyncio.sleep(0.01)
                 full_res = await test_payloads_on_url(client, url, full_payloads, timeout)
                 if full_res:
@@ -342,9 +315,9 @@ async def worker_job(url: str, smoke_payloads: List[str], full_payloads: Optiona
     finally:
         await client.aclose()
 
-async def run_scan(urls: List[str], smoke_payloads: List[str], full_payloads: Optional[List[str]], concurrency: int, proxies: List[str], outdir: str, html_filename: str, verify_with_playwright: bool):
+async def run_scan(urls: List[str], smoke_payloads: List[str], full_payloads: Optional[List[str]], concurrency: int, proxies: List[str], outdir: str, html_filename: str, verify_with_playwright: bool, template_path: Optional[str]=None):
     ensure_dir(outdir)
-    path_report = await write_dashboard_initial(outdir, html_filename, use_template_path=DEFAULT_TEMPLATE if os.path.exists(DEFAULT_TEMPLATE) else None)
+    await write_dashboard_initial(outdir, html_filename, template_path)
     limits = httpx.Limits(max_keepalive_connections=max(10, concurrency//2), max_connections=max(50, concurrency*2))
     proxies_cycle = cycle(proxies) if proxies else None
     session_factory = make_session_factory(proxies_cycle, verify_tls=True, limits=limits, http2=True)
@@ -364,10 +337,8 @@ async def run_scan(urls: List[str], smoke_payloads: List[str], full_payloads: Op
         tasks.append(asyncio.create_task(sem_job(u)))
 
     hits_set: Set[str] = set()
-    evidence_batch = []
 
     async def consumer():
-        nonlocal evidence_batch
         while True:
             try:
                 item = await asyncio.wait_for(found_q.get(), timeout=1.0)
@@ -381,7 +352,6 @@ async def run_scan(urls: List[str], smoke_payloads: List[str], full_payloads: Op
             test_url, payload, text, original = item
             if test_url not in hits_set:
                 hits_set.add(test_url)
-                # save evidence
                 relpath = None
                 if SAVE_EVIDENCE:
                     ev_dir = ensure_dir(os.path.join(outdir, "evidence"))
@@ -394,127 +364,218 @@ async def run_scan(urls: List[str], smoke_payloads: List[str], full_payloads: Op
                         relpath = os.path.relpath(fn, outdir)
                     except Exception:
                         relpath = None
-                # optional Playwright verification
                 verified = False
                 if verify_with_playwright:
-                    # use test_url (payload already injected) to verify
                     verified = await playwright_verify(test_url, payload, timeout=12.0)
-                # append live report immediately
-                await append_to_dashboard(outdir, html_filename, test_url if verified or not verify_with_playwright else original, payload, 'vulnerable' if verified or not verify_with_playwright else 'suspect')
-                # terminal notify
+                status = 'vulnerable' if (verified or not verify_with_playwright) else 'suspect'
+                safe_name = safe_name_for_file(test_url)
+                await append_to_dashboard(outdir, html_filename, test_url if (verified or not verify_with_playwright) else original, payload, status, safe_name)
                 print(Fore.MAGENTA + Style.BRIGHT + f"[>>> FOUND] {test_url} payload={payload} verified={verified}" + Style.RESET_ALL)
-            # batching (not used heavily here)
-            if len(evidence_batch) >= BATCH_EVIDENCE_FLUSH:
-                # flush if you implement batch writes (optional)
-                evidence_batch = []
     consumer_task = asyncio.create_task(consumer())
     await asyncio.gather(*tasks)
     await consumer_task
 
-    # save hits list
     hits_file = os.path.join(outdir, "xss_found_urls.txt")
     async with aiofiles.open(hits_file, "w", encoding="utf-8") as f:
         for h in sorted(hits_set):
             await f.write(h + "\n")
 
-    print(Fore.GREEN + f"[✓] Scan finished. {len(hits_set)} hits. Report: {path_report} and {hits_file}" + Style.RESET_ALL)
+    print(Fore.GREEN + f"[✓] Scan finished. {len(hits_set)} hits. Report: {os.path.join(outdir, html_filename)} and {hits_file}" + Style.RESET_ALL)
 
-# -------------------------
-# CLI and flow
-# -------------------------
-def parse_xray_style_args(argv: List[str]):
-    # support: xray webscan --basic-crawler <target> --html-output <file>
-    # argv is sys.argv[1:]
-    if len(argv) >= 2 and argv[0] == "webscan":
-        p = argparse.ArgumentParser(prog="xray webscan")
-        p.add_argument("--basic-crawler", required=True)
-        p.add_argument("--html-output", default="vuln.html")
-        p.add_argument("--workers", type=int, default=CONCURRENCY_DEFAULT)
-        p.add_argument("--proxies")
-        p.add_argument("--limit-urls", type=int, default=0)
-        p.add_argument("--playwright", action="store_true", help="Verify using Playwright (slow)")
-        return p.parse_args(argv[1:])
-    return None
+# ---------------------
+# CLI: subcommands
+# ---------------------
+def cmd_proxy_check(args):
+    if not args.proxies or not os.path.exists(args.proxies):
+        print(Fore.YELLOW + "[!] proxies file not found" + Style.RESET_ALL); return
+    with open(args.proxies, encoding='utf-8') as f:
+        proxies = [l.strip() for l in f if l.strip() and not l.strip().startswith('#')]
+    good = []
+    print(f"[i] Testing {len(proxies)} proxies...")
+    for p in proxies:
+        ok, info = proxy_health_check_sync(p)
+        print(f" - {p} -> ok={ok}")
+        if ok: good.append(p)
+    out = args.out or "proxies_good.txt"
+    with open(out, "w", encoding='utf-8') as f:
+        for g in good: f.write(g + "\n")
+    print(Fore.GREEN + f"[✓] good proxies saved to {out}" + Style.RESET_ALL)
 
-def parse_args():
-    import sys
-    # check if invoked like: xray webscan ...
-    if len(sys.argv) > 1 and sys.argv[1] == "webscan":
-        # emulate xray subcommand
-        args = parse_xray_style_args(sys.argv[1:])
-        if args:
-            return {
-                "targets": args.basic_crawler,
-                "workers": args.workers,
-                "proxies": args.proxies,
-                "limit_urls": args.limit_urls,
-                "html_output": args.html_output,
-                "playwright": args.playwright
-            }
-    p = argparse.ArgumentParser(prog="xrayxss")
-    p.add_argument("--targets", "-t", required=True, help="domain or file with URLs")
-    p.add_argument("--workers", type=int, default=CONCURRENCY_DEFAULT)
-    p.add_argument("--proxies", help="path to proxies.txt (one per line)")
-    p.add_argument("--outdir", default=OUTDIR_DEFAULT)
-    p.add_argument("--html-output", default="vuln.html")
-    p.add_argument("--limit-urls", type=int, default=0)
-    p.add_argument("--playwright", action="store_true", help="Verify hits using Playwright (slower)")
-    ns = p.parse_args()
-    return {
-        "targets": ns.targets,
-        "workers": ns.workers,
-        "proxies": ns.proxies,
-        "limit_urls": ns.limit_urls,
-        "html_output": ns.html_output,
-        "playwright": ns.playwright
-    }
-
-def gather_target_urls(arg_target: str, limit: int=0) -> List[str]:
-    # if file: read urls; if domain: use wayback + crawl
-    if os.path.exists(arg_target):
-        with open(arg_target, "r", encoding="utf-8") as f:
-            urls = [l.strip() for l in f if l.strip()]
-        return [u for u in urls if ("?" in u or "=" in u)]
-    domain = arg_target.strip()
-    print(Fore.CYAN + f"[~] Gathering URLs for {domain} (wayback + crawl) ..." + Style.RESET_ALL)
-    wayback = load_wayback(domain, limit=limit if limit>0 else 500)
-    crawled = crawl_site(f"http://{domain}", max_depth=1, max_pages=200)
+def cmd_crawl(args):
+    t = args.target
+    limit = args.limit or 500
+    print(Fore.CYAN + f"[~] Wayback + crawl for {t} (limit={limit})" + Style.RESET_ALL)
+    wayback = load_wayback(t, limit=limit)
+    crawled = crawl_site(f"http://{t}", max_depth=args.depth or 1, max_pages=args.max or 200)
     combined = list(dict.fromkeys(wayback + crawled))
-    return [u for u in combined if ("?" in u or "=" in u)][:limit if limit>0 else None] if limit>0 else [u for u in combined if ("?" in u or "=" in u)]
+    paramed = [u for u in combined if ("?" in u or "=" in u)]
+    out = args.out or "crawled_urls.txt"
+    with open(out, "w", encoding='utf-8') as f:
+        for u in paramed: f.write(u + "\n")
+    print(Fore.GREEN + f"[✓] saved {len(paramed)} parameterized urls to {out}" + Style.RESET_ALL)
 
-async def main():
-    opts = parse_args()
-    targets_arg = opts["targets"]
-    workers = opts["workers"]
-    proxies_path = opts["proxies"]
-    outdir = opts.get("outdir", OUTDIR_DEFAULT)
-    html_output = opts.get("html_output", "vuln.html")
-    limit_urls = opts.get("limit_urls", 0)
-    verify_play = opts.get("playwright", False)
+def cmd_report(args):
+    outdir = args.outdir or OUTDIR_DEFAULT
+    hits = []
+    hits_file = os.path.join(outdir, "xss_found_urls.txt")
+    if os.path.exists(hits_file):
+        with open(hits_file, encoding='utf-8') as f:
+            hits = [l.strip() for l in f if l.strip()]
+    if not hits:
+        print(Fore.YELLOW + "[!] no hits file found" + Style.RESET_ALL); return
+    # build simple HTML (or reuse template)
+    template = args.template if args.template and os.path.exists(args.template) else None
+    async def build():
+        await write_dashboard_initial(outdir, args.html or "report.html", template)
+        # optionally append rows from evidence
+        for h in hits:
+            safe = safe_name_for_file(h)
+            await append_to_dashboard(outdir, args.html or "report.html", h, "(payload unknown)", "vulnerable", safe)
+    asyncio.run(build())
+    print(Fore.GREEN + f"[✓] report ready: {os.path.join(outdir, args.html or 'report.html')}" + Style.RESET_ALL)
+
+def cmd_webscan(argv):
+    # emulate `xray webscan --basic-crawler target --html-output file`
+    parser = argparse.ArgumentParser(prog="xray webscan")
+    parser.add_argument("--basic-crawler", required=True)
+    parser.add_argument("--html-output", default="vuln.html")
+    parser.add_argument("--workers", type=int, default=CONCURRENCY_DEFAULT)
+    parser.add_argument("--proxies")
+    parser.add_argument("--limit-urls", type=int, default=0)
+    parser.add_argument("--playwright", action="store_true")
+    ns = parser.parse_args(argv)
+    # map to main scan
+    args = argparse.Namespace(
+        targets=ns.basic_crawler,
+        workers=ns.workers,
+        proxies=ns.proxies,
+        outdir=OUTDIR_DEFAULT,
+        html_output=ns.html_output,
+        template=None,
+        limit_urls=ns.limit_urls,
+        playwright=ns.playwright
+    )
+    # call scan flow
+    asyncio.run(flow_scan(args))
+
+async def flow_scan(ns):
+    # gather targets
+    targets_arg = ns.targets
+    workers = ns.workers
+    proxies_path = ns.proxies
+    outdir = ns.outdir
+    html_output = ns.html_output
+    limit_urls = ns.limit_urls
+    template = ns.template
+    verify_play = ns.playwright
 
     proxies = []
     if proxies_path and os.path.exists(proxies_path):
-        with open(proxies_path, "r", encoding="utf-8") as f:
-            proxies = [l.strip() for l in f if l.strip()]
+        with open(proxies_path, encoding='utf-8') as f:
+            proxies = [l.strip() for l in f if l.strip() and not l.strip().startswith('#')]
 
-    urls = gather_target_urls(targets_arg, limit=limit_urls)
+    # gather urls
+    print(Fore.CYAN + f"[~] gathering urls for {targets_arg}" + Style.RESET_ALL)
+    urls = []
+    if os.path.exists(targets_arg):
+        with open(targets_arg, encoding='utf-8') as f:
+            urls = [l.strip() for l in f if l.strip()]
+        urls = [u for u in urls if ("?" in u or "=" in u)]
+    else:
+        domain = targets_arg.strip()
+        wayback = load_wayback(domain, limit=limit_urls if limit_urls>0 else 500)
+        crawled = crawl_site(f"http://{domain}", max_depth=1, max_pages=200)
+        combined = list(dict.fromkeys(wayback + crawled))
+        urls = [u for u in combined if ("?" in u or "=" in u)]
+        if limit_urls and limit_urls>0:
+            urls = urls[:limit_urls]
+
     if not urls:
-        print(Fore.YELLOW + "[!] No parameterized URLs found, exiting." + Style.RESET_ALL)
-        return
+        print(Fore.YELLOW + "[!] no parameterized urls found, exiting" + Style.RESET_ALL); return
 
-    # payloads: smoke then full (if user provides xss.txt)
     full_payloads = load_payloads(XSS_PAYLOAD_FILE)
-    smoke = SMOKE_PAYLOADS.copy()
+    smoke = SMOKE_DEFAULT.copy()
     if full_payloads:
-        # take top N as smoke if many
-        smoke = full_payloads[:SMOKE_COUNT] if len(full_payloads) >= SMOKE_COUNT else full_payloads
+        smoke = full_payloads[:min(len(full_payloads), 30)]
 
-    print(Fore.GREEN + f"[i] Targets to scan: {len(urls)} URLs | Workers: {workers} | Proxies: {len(proxies)} | HTML: {html_output}" + Style.RESET_ALL)
+    print(Fore.GREEN + f"[i] scanning {len(urls)} urls | workers={workers} | proxies={len(proxies)}" + Style.RESET_ALL)
+    await run_scan(urls, smoke, full_payloads, workers, proxies, outdir, html_output, verify_play, template)
 
-    await run_scan(urls, smoke, full_payloads, workers, proxies, outdir, html_output, verify_play)
+def cmd_scan(args):
+    asyncio.run(flow_scan(args))
+
+# ---------------------
+# main entrypoint
+# ---------------------
+def main():
+    parser = argparse.ArgumentParser(prog="xrayxss", description="xray-like XSS scanner")
+    sub = parser.add_subparsers(dest="cmd", required=False)
+
+    p_scan = sub.add_parser("scan", help="gather and scan a target (wayback+crawl+scan)")
+    p_scan.add_argument("--targets","-t", required=True)
+    p_scan.add_argument("--workers", type=int, default=CONCURRENCY_DEFAULT)
+    p_scan.add_argument("--proxies")
+    p_scan.add_argument("--outdir", default=OUTDIR_DEFAULT)
+    p_scan.add_argument("--html-output", default="vuln.html")
+    p_scan.add_argument("--template")
+    p_scan.add_argument("--limit-urls", type=int, default=0)
+    p_scan.add_argument("--playwright", action="store_true")
+
+    p_crawl = sub.add_parser("crawl", help="just crawl and wayback")
+    p_crawl.add_argument("--target", required=True)
+    p_crawl.add_argument("--limit", type=int, default=500)
+    p_crawl.add_argument("--depth", type=int, default=1)
+    p_crawl.add_argument("--max", type=int, default=200)
+    p_crawl.add_argument("--out")
+
+    p_pcheck = sub.add_parser("proxy-check", help="test proxies list")
+    p_pcheck.add_argument("--proxies", required=True)
+    p_pcheck.add_argument("--out", default="proxies_good.txt")
+
+    p_report = sub.add_parser("report", help="build report from existing hits")
+    p_report.add_argument("--outdir", default=OUTDIR_DEFAULT)
+    p_report.add_argument("--html", default="report.html")
+    p_report.add_argument("--template")
+
+    # accept xray-style (webscan) too
+    p_web = sub.add_parser("webscan", help="xray webscan alias")
+    p_web.add_argument("--basic-crawler", required=True)
+    p_web.add_argument("--html-output", default="vuln.html")
+    p_web.add_argument("--workers", type=int, default=CONCURRENCY_DEFAULT)
+    p_web.add_argument("--proxies")
+    p_web.add_argument("--limit-urls", type=int, default=0)
+    p_web.add_argument("--playwright", action="store_true")
+
+    # if no subcommand, print help
+    if len(sys.argv) <= 1:
+        parser.print_help(); return
+
+    args = parser.parse_args()
+
+    if args.cmd == "proxy-check":
+        cmd_proxy_check(args); return
+    if args.cmd == "crawl":
+        cmd_crawl(args); return
+    if args.cmd == "report":
+        cmd_report(args); return
+    if args.cmd == "webscan":
+        # map webscan to flow_scan
+        ns = argparse.Namespace(
+            targets=args.basic_crawler,
+            workers=args.workers,
+            proxies=args.proxies,
+            outdir=OUTDIR_DEFAULT,
+            html_output=args.html_output,
+            template=None,
+            limit_urls=args.limit_urls,
+            playwright=args.playwright
+        )
+        asyncio.run(flow_scan(ns)); return
+    if args.cmd == "scan":
+        cmd_scan(args); return
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         print(Fore.RED + "\n[!] Aborted by user." + Style.RESET_ALL)
