@@ -33,14 +33,8 @@ python3 -m venv venv && source venv/bin/activate && pip install --upgrade pip &&
 
 3. Run:
 ```bash
-# Scan normal
-python3 zerofox_v2.py
 
-# Scan lebih agresif
-python3 zerofox_v2.py --workers 15 --rate-limit 0.02 --timeout 2
-
-# Scan super cepat (berisiko berat)
-python3 zerofox_v2.py --workers 30 --rate-limit 0.005 --timeout 1
+python zerofox_async_html_report.py --targets example.com --workers 120 --outdir output_report --html-output vuln.html
 
 ```
 
