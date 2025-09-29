@@ -10,6 +10,9 @@ Only use this tool on targets where you have **explicit written authorization**.
 ## Quick setup (Ubuntu)
 1. Create Python venv:
 ```bash
+pip install "httpx[http2]" beautifulsoup4 colorama aiofiles requests
+pip install websockets
+pip install httpx-cache
 sudo apt update && sudo apt install -y git
 git clone https://github.com/Zero-F0X/ZeroFox_V2.git
 pip install --upgrade pip
@@ -17,6 +20,12 @@ python3 -m playwright install chromium
 cd ZeroFox_V2
 pip install -r requirements.txt
 
+
+```
+One line:
+```bash
+
+python3 -m venv venv && source venv/bin/activate && pip install --upgrade pip && pip install "httpx[http2]" beautifulsoup4 colorama aiofiles requests
 
 ```
 
