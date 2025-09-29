@@ -34,7 +34,7 @@ python3 -m venv venv && source venv/bin/activate && pip install --upgrade pip &&
 3. Run:
 ```bash
 
-python zerofox_async_html_report.py --targets example.com --workers 120 --outdir output_report --html-output vuln.html
+python3 zerofox_v2.py --targets example.com --workers 120 --outdir output_report --html-output vuln.html
 
 ```
 
