@@ -1,299 +1,241 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# ZeroFox v2 - XSS Scanner with scan-time loading animation
-# Use ONLY on authorized targets.
+"""
+Fast async XSS scanner (authorized use only).
+- Uses asyncio + httpx.AsyncClient for high throughput.
+- Reuses connections, supports optional rotating proxies.
+- Two-stage approach: quick smoke test (small payload list) then full fuzz on positives.
+- Batch writes evidence to disk.
+"""
 
+import asyncio
 import os
+import re
 import sys
 import time
 import random
-import re
-import urllib.parse
-import requests
-import urllib3
-import threading
-import queue
 import argparse
-from functools import partial
-import concurrent.futures
+import urllib.parse
+from itertools import cycle
+from typing import List, Optional, Tuple, Dict, Set
 
-# Third-party
-try:
-    from colorama import Fore, Style, init as colorama_init
-    from bs4 import BeautifulSoup
-except Exception as e:
-    print("Missing dependencies. Install with: pip install requests beautifulsoup4 colorama")
-    raise e
-
-# Optional Playwright (kept optional)
-HEADLESS_ENABLED = False
-_playwright_available = False
-if HEADLESS_ENABLED:
-    try:
-        from playwright.sync_api import sync_playwright
-        _playwright_available = True
-    except Exception:
-        _playwright_available = False
+import httpx
+from bs4 import BeautifulSoup
+from colorama import Fore, Style, init as colorama_init
+import aiofiles
 
 colorama_init(autoreset=True)
-urllib3.disable_warnings()
 
 # -------------------------
-# Defaults (override via CLI)
+# Config (tweak)
 # -------------------------
-XSS_PAYLOAD_FILE = "xss.txt"
-RATE_LIMIT = 0.10
-REQUEST_TIMEOUT = 8
-SHORT_TIMEOUT = 3
+XSS_PAYLOAD_FILE = "xss.txt"       # full payload list
+SMOKE_PAYLOAD_FILE = None          # optional separate smoke payload file (if None, use top N from xss.txt)
+SMOKE_PAYLOAD_COUNT = 30          # number of quick payloads to test first
+OUTDIR = "output_async"
+CONCURRENCY = 150                 # total simultaneous requests
+RATE_LIMIT_PER_HOST = 0.02       # minimal delay per-host between requests (seconds)
+MAX_REQUESTS_PER_SECOND = 300    # global throttle (safety)
+REQUEST_TIMEOUT = 6.0
+VERIFY_TLS = False               # set True if you want verification
 SAVE_EVIDENCE = True
-MAX_WORKERS = 8
-UI_UPDATE_INTERVAL = 0.06
+BATCH_EVIDENCE_FLUSH = 20        # write evidence to disk in batches
+
+# Optional proxy list (round-robin). Put proxies as "http://user:pass@ip:port" or "http://ip:port"
+proxies_list: List[str] = []
+
 
 # -------------------------
-# UI helpers
+# Helpers
 # -------------------------
-def clear_screen():
-    os.system('cls' if os.name == 'nt' else 'clear')
-
-def slow_print(text, delay=0.005, end="\n"):
-    for ch in text:
-        sys.stdout.write(ch)
-        sys.stdout.flush()
-        time.sleep(delay)
-    sys.stdout.write(end)
-    sys.stdout.flush()
-
-def typing_effect(lines, w_delay=0.01, between=0.10):
-    for line in lines:
-        slow_print(line, delay=w_delay)
-        time.sleep(between)
-
-def banner():
-    b = r"""
- ███████████ ██████████ ███████████      ███████       ███████████
-░█░░░░░░███ ░░███░░░░░█░░███░░░░░███   ███░░░░░███    ░░███░░░░░░█
-░     ███░   ░███  █ ░  ░███    ░███  ███     ░░███    ░███   █ ░
-     ███     ░██████    ░██████████  ░███      ░███    ░███████
-    ███      ░███░░█    ░███░░░░░███ ░███      ░███    ░███░░░█
-  ████     █ ░███ ░   █ ░███    ░███ ░░███     ███     ░███  ░
- ███████████ ██████████ █████   █████ ░░░███████░      █████
-"""
-    print(Fore.RED + Style.BRIGHT + b + Style.RESET_ALL)
-    intro = [
-        Fore.LIGHTBLACK_EX + "ZeroFox v2" + Style.RESET_ALL + " — XSS Scanner (authorized use only).",
-        Fore.YELLOW + "Starting modules..." + Style.RESET_ALL
-    ]
-    typing_effect(intro, w_delay=0.01, between=0.08)
-
-def startup_animation():
-    clear_screen()
-    banner()
-    # small matrix
-    for _ in range(4):
-        line = "".join(random.choice("01") for _ in range(60))
-        print(Fore.GREEN + line + Style.RESET_ALL)
-        time.sleep(0.03)
-    print()
-
-# -------------------------
-# File / payload helpers
-# -------------------------
-def ensure_dir(path):
+def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
     return path
 
-def save_list(path, items):
-    ensure_dir(os.path.dirname(path) if os.path.dirname(path) else ".")
-    with open(path, "w", encoding="utf-8") as f:
-        for it in items:
-            f.write(it + "\n")
-
-def load_xss_payloads(path=XSS_PAYLOAD_FILE):
-    if os.path.exists(path):
-        with open(path, encoding="utf-8", errors="ignore") as f:
-            payloads = [line.rstrip("\n") for line in f if line.strip()]
-        print(Fore.GREEN + f"[i] Loaded {len(payloads)} payload(s) from {path}." + Style.RESET_ALL)
-        return payloads
-    else:
-        print(Fore.YELLOW + f"[!] {path} not found — no XSS payloads loaded." + Style.RESET_ALL)
+def load_payloads(path: str) -> List[str]:
+    if not os.path.exists(path):
+        print(Fore.YELLOW + f"[!] Payload file not found: {path}" + Style.RESET_ALL)
         return []
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        lines = [l.strip() for l in f if l.strip()]
+    print(Fore.GREEN + f"[i] Loaded {len(lines)} payloads from {path}" + Style.RESET_ALL)
+    return lines
 
-def inject_payload(url, payload):
-    try:
-        base, params = url.split("?", 1)
-        new_params = "&".join(f"{p.split('=')[0]}={urllib.parse.quote(payload)}" for p in params.split("&"))
-        return f"{base}?{new_params}"
-    except Exception:
+def inject_payload(url: str, payload: str) -> str:
+    # inject the url-encoded payload into each param value (fast)
+    if "?" not in url:
         return url
+    base, qs = url.split("?", 1)
+    parts = []
+    for p in qs.split("&"):
+        if "=" in p:
+            k, v = p.split("=", 1)
+            parts.append(f"{k}={urllib.parse.quote(payload)}")
+        else:
+            parts.append(f"{p}={urllib.parse.quote(payload)}")
+    return f"{base}?{'&'.join(parts)}"
 
-def save_evidence_html(outdir, safe_name, payload, resp_text):
-    ev_dir = ensure_dir(os.path.join(outdir, "evidence"))
-    fn = os.path.join(ev_dir, f"{safe_name}.html")
+def safe_name_for_file(s: str) -> str:
+    return re.sub(r'[^0-9A-Za-z\-_\.]', '_', s)[:200]
+
+# Basic filter for wayback / crawl results: keep only parameterized URLs
+def filter_parameterized(urls: List[str], limit: Optional[int]=None) -> List[str]:
+    out = [u for u in urls if "?" in u or "=" in u]
+    # dedupe preserve order
+    seen = set()
+    dedup = []
+    for u in out:
+        if u not in seen:
+            seen.add(u)
+            dedup.append(u)
+    if limit:
+        return dedup[:limit]
+    return dedup
+
+# -------------------------
+# Async HTTP utilities
+# -------------------------
+class HostRateLimiter:
+    """Simple per-host rate limiter using last request timestamps."""
+    def __init__(self, min_delay: float):
+        self.min_delay = min_delay
+        self._last: Dict[str, float] = {}
+        self._lock = asyncio.Lock()
+
+    async def wait(self, host: str):
+        async with self._lock:
+            now = time.monotonic()
+            last = self._last.get(host, 0.0)
+            wait_for = self.min_delay - (now - last)
+            if wait_for > 0:
+                await asyncio.sleep(wait_for)
+            self._last[host] = time.monotonic()
+
+# Global rate manager (simple token bucket)
+class GlobalRateLimiter:
+    def __init__(self, rps: int):
+        self._interval = 1.0 / max(1, rps)
+        self._lock = asyncio.Lock()
+        self._last = 0.0
+
+    async def wait(self):
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last
+            if elapsed < self._interval:
+                await asyncio.sleep(self._interval - elapsed)
+            self._last = time.monotonic()
+
+# -------------------------
+# Scanner core (async)
+# -------------------------
+async def fetch_text(client: httpx.AsyncClient, url: str, timeout: float) -> Optional[str]:
     try:
-        with open(fn, "w", encoding="utf-8") as f:
-            f.write(f"<!-- payload: {payload} -->\n")
-            f.write(resp_text)
+        r = await client.get(url, timeout=timeout)
+        return r.text or ""
     except Exception:
-        pass
-    return fn
+        return None
 
-# -------------------------
-# Scan animation (spinner + progress + immediate found)
-# -------------------------
-def scan_animation(stop_event, counters, total, found_q):
-    spinner = ["|", "/", "-", "\\"]
-    width = 36
-    idx = 0
-    try:
-        while not stop_event.is_set():
-            scanned = counters.get("scanned", 0)
-            found = counters.get("found", 0)
-            pct = int((scanned / total) * 100) if total else 0
-            filled = int((pct / 100) * width)
-            bar = "█" * filled + "-" * (width - filled)
-            spin = spinner[idx % len(spinner)]
-            # clear small area
-            sys.stdout.write("\x1b[2J\x1b[H")
-            sys.stdout.write(Fore.CYAN + f" ZeroFox v2 — SCANNING\n" + Style.RESET_ALL)
-            sys.stdout.write(Fore.YELLOW + f" [{spin}] {scanned}/{total} URLs scanned | Found: {found}\n" + Style.RESET_ALL)
-            sys.stdout.write(Fore.RED + f" Progress: [{bar}] {pct}%\n" + Style.RESET_ALL)
-            # show up to 4 immediate founds
-            try:
-                for _ in range(4):
-                    u = found_q.get_nowait()
-                    sys.stdout.write(Fore.MAGENTA + Style.BRIGHT + f" >>> FOUND: {u}\n" + Style.RESET_ALL)
-            except queue.Empty:
-                pass
-            sys.stdout.flush()
-            time.sleep(UI_UPDATE_INTERVAL * 6)
-            idx += 1
-    finally:
-        sys.stdout.write("\x1b[2J\x1b[H")
-        sys.stdout.flush()
-
-# -------------------------
-# Worker (fast checks)
-# -------------------------
-def _scan_url_worker(url, payloads, outdir, rate_limit, timeout, found_q):
-    session = requests.Session()
-    session.headers.update({"User-Agent": "ZeroFox-v2/1.0"})
-    try:
-        for p in payloads:
-            test = inject_payload(url, p)
-            try:
-                r = session.get(test, timeout=timeout, verify=False)
-                text = r.text or ""
-                dec = urllib.parse.unquote_plus(p)
-                if p in text or dec in text:
-                    # save evidence quickly
-                    safe = re.sub(r'[^0-9A-Za-z\-_\.]', '_', test)[:160]
-                    if SAVE_EVIDENCE:
-                        save_evidence_html(outdir, safe + "__resp", p, text)
-                    found_q.put(test)
-                    return test
-            except Exception:
-                pass
-            finally:
-                if rate_limit:
-                    time.sleep(rate_limit)
-    finally:
-        try:
-            session.close()
-        except:
-            pass
+async def test_payloads_on_url(client: httpx.AsyncClient, url: str, payloads: List[str], timeout: float) -> Optional[Tuple[str, str, str]]:
+    """
+    Try payloads on a single URL. Return first successful (test_url, payload, raw_text).
+    """
+    for p in payloads:
+        test_url = inject_payload(url, p)
+        text = await fetch_text(client, test_url, timeout)
+        if text is None:
+            continue
+        dec = urllib.parse.unquote_plus(p)
+        if p in text or dec in text:
+            return (test_url, p, text)
     return None
 
-# -------------------------
-# Optimized scan with animation + immediate reporting
-# -------------------------
-def optimized_scan_xss(urls, outdir, payloads, workers, rate_limit, timeout):
-    hits = []
-    target = [u for u in urls if "?" in u]
-    total = len(target)
-    print(Fore.CYAN + f"[i] Scanning {total} parameterized URLs with {workers} workers..." + Style.RESET_ALL)
-    if total == 0 or not payloads:
-        print(Fore.YELLOW + "[!] Nothing to scan (no parameterized URLs or no payloads)." + Style.RESET_ALL)
-        return hits
+async def worker_job(url: str,
+                     smoke_payloads: List[str],
+                     full_payloads: Optional[List[str]],
+                     session_factory,
+                     host_rl: HostRateLimiter,
+                     global_rl: GlobalRateLimiter,
+                     found_queue: asyncio.Queue,
+                     timeout: float):
+    """
+    2-stage: quick smoke test (smoke_payloads). If positive and full_payloads provided, run full fuzzing (full_payloads).
+    session_factory -> returns httpx.AsyncClient (preconfigured) for this job (for proxy rotation).
+    """
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc
+    # respect small delays
+    await host_rl.wait(host)
+    await global_rl.wait()
 
-    counters = {"scanned": 0, "found": 0}
-    counters_lock = threading.Lock()
-    found_q = queue.Queue()
-    stop_anim = threading.Event()
-    anim_thread = threading.Thread(target=scan_animation, args=(stop_anim, counters, total, found_q), daemon=True)
-    anim_thread.start()
-
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
-    futures = []
-
-    def _cb(fut, url):
-        nonlocal counters
-        try:
-            res = fut.result()
-            with counters_lock:
-                counters["scanned"] += 1
-                if res:
-                    counters["found"] += 1
-        except Exception as e:
-            with counters_lock:
-                counters["scanned"] += 1
-            with open("scan_errors.log", "a", encoding="utf-8") as ef:
-                ef.write(f"{time.asctime()} - error scanning {url}: {e}\n")
-
+    client: httpx.AsyncClient = session_factory()
     try:
-        for u in target:
-            fut = executor.submit(_scan_url_worker, u, payloads, outdir, rate_limit, timeout, found_q)
-            fut.add_done_callback(lambda f, url=u: _cb(f, url))
-            futures.append(fut)
-
-        # wait for completion; founds are printed via animation (from queue)
-        concurrent.futures.wait(futures)
-    except KeyboardInterrupt:
-        print(Fore.RED + "\n[!] Aborted by user. Waiting for threads to finish..." + Style.RESET_ALL)
-        executor.shutdown(wait=False)
+        # smoke stage
+        res = await test_payloads_on_url(client, url, smoke_payloads, timeout)
+        if res:
+            test_url, p, text = res
+            await found_queue.put((test_url, p, text))
+            # run full fuzz only if full_payloads provided
+            if full_payloads:
+                # small delay before heavy fuzz to avoid burst
+                await asyncio.sleep(0.01)
+                full_res = await test_payloads_on_url(client, url, full_payloads, timeout)
+                if full_res:
+                    await found_queue.put(full_res)
     finally:
-        try:
-            executor.shutdown(wait=True)
-        except:
-            pass
-
-    # stop animation and drain found queue
-    stop_anim.set()
-    anim_thread.join()
-    while not found_q.empty():
-        try:
-            hits.append(found_q.get_nowait())
-        except queue.Empty:
-            break
-
-    hits = sorted(set(hits))
-    save_list(os.path.join(outdir, "xss_found_urls.txt"), hits)
-    print(Fore.GREEN + f"[✓] Scan finished. {len(hits)} vulnerable endpoints found. Results saved to {outdir}/xss_found_urls.txt" + Style.RESET_ALL)
-    return hits
+        await client.aclose()
 
 # -------------------------
-# Crawling helpers (simple)
+# Session factory (for proxy rotation)
 # -------------------------
-def find_urls(domain, outdir):
+def make_session_factory(proxies_cycle: Optional[cycle], verify_tls: bool, limits: Optional[httpx.Limits]=None):
+    """
+    Returns a function that creates AsyncClient instances.
+    If proxies_cycle is provided, it's used round-robin per client.
+    """
+    def factory():
+        proxy = None
+        if proxies_cycle:
+            proxy = next(proxies_cycle)
+        client = httpx.AsyncClient(http2=True,
+                                   verify=verify_tls,
+                                   timeout=REQUEST_TIMEOUT,
+                                   limits=limits)
+        if proxy:
+            client._transport._pool.max_keepalive = 5  # small tweak if underlying transport is available
+            client._proxies = {"all://": proxy}  # httpx low-level proxies; works for simple rotation
+        return client
+    return factory
+
+# -------------------------
+# Simple crawler / wayback loader (sync, light)
+# -------------------------
+def load_wayback(domain: str, limit: int = 1000) -> List[str]:
+    # keep this small / fast by limiting results
     try:
-        r = requests.get(f"http://web.archive.org/cdx/search/cdx?url=*.{domain}/*&output=text&fl=original&collapse=urlkey", timeout=15)
-        urls = sorted(set(r.text.splitlines()))
-        save_list(os.path.join(outdir, "urls.txt"), urls)
-        return urls
+        import requests
+        url = f"http://web.archive.org/cdx/search/cdx?url=*.{domain}/*&output=text&fl=original&collapse=urlkey"
+        r = requests.get(url, timeout=12)
+        lines = [l.strip() for l in r.text.splitlines() if l.strip()]
+        return lines[:limit]
     except Exception:
         return []
 
-def crawl_site(start_url, outdir, max_depth=2):
+def crawl_site(start_url: str, max_depth: int = 1, max_pages: int = 300) -> List[str]:
     from urllib.parse import urljoin
     domain = urllib.parse.urlparse(start_url).netloc
-    visited, q, found = set(), [(start_url, 0)], []
-    while q:
+    visited = set()
+    q = [(start_url, 0)]
+    found = []
+    while q and len(visited) < max_pages:
         url, depth = q.pop(0)
         if url in visited or depth > max_depth:
             continue
         visited.add(url)
         try:
-            r = requests.get(url, timeout=REQUEST_TIMEOUT, verify=False)
-            soup = BeautifulSoup(r.text, "html.parser")
+            import requests
+            r = requests.get(url, timeout=6, verify=False)
+            soup = BeautifulSoup(r.text or "", "html.parser")
             for link in soup.find_all("a", href=True):
                 full = urljoin(url, link['href'])
                 if domain in full and full not in visited:
@@ -302,59 +244,156 @@ def crawl_site(start_url, outdir, max_depth=2):
                     q.append((full, depth + 1))
         except Exception:
             continue
-    save_list(os.path.join(outdir, "crawled_urls.txt"), sorted(set(found)))
-    return found
+    return sorted(set(found))
 
 # -------------------------
-# Flow
+# Orchestration
 # -------------------------
-def scan_domain(domain, workers, rate_limit, timeout):
-    outdir = f"output/{domain}"
-    ensure_dir(outdir)
-    print(Fore.CYAN + f"[~] Gathering URLs for {domain}..." + Style.RESET_ALL)
-    wayback = find_urls(domain, outdir)
-    crawled = crawl_site(f"http://{domain}", outdir)
-    urls = list(set(wayback + crawled))
-    save_list(os.path.join(outdir, "all_urls.txt"), urls)
-    payloads = load_xss_payloads(XSS_PAYLOAD_FILE)
-    optimized_scan_xss(urls, outdir, payloads, workers, rate_limit, timeout)
+async def run_scan(urls: List[str],
+                   smoke_payloads: List[str],
+                   full_payloads: Optional[List[str]],
+                   concurrency: int,
+                   proxies: List[str]):
+    ensure_dir(OUTDIR)
+    # limits for httpx AsyncClient (connections)
+    limits = httpx.Limits(max_keepalive_connections=concurrency//2 or 10,
+                          max_connections=concurrency*2 or 100)
+
+    proxies_cycle = cycle(proxies) if proxies else None
+    session_factory = make_session_factory(proxies_cycle, verify_tls=VERIFY_TLS, limits=limits)
+
+    host_rl = HostRateLimiter(RATE_LIMIT_PER_HOST)
+    global_rl = GlobalRateLimiter(MAX_REQUESTS_PER_SECOND)
+
+    sem = asyncio.Semaphore(concurrency)
+    found_queue: asyncio.Queue = asyncio.Queue()
+    tasks = []
+
+    async def sem_job(u):
+        async with sem:
+            await worker_job(u, smoke_payloads, full_payloads, session_factory, host_rl, global_rl, found_queue, REQUEST_TIMEOUT)
+
+    # spawn tasks
+    for u in urls:
+        tasks.append(asyncio.create_task(sem_job(u)))
+
+    # consumer for found_queue: batch write evidence
+    hits_set: Set[str] = set()
+    evidence_batch = []
+
+    async def consumer():
+        nonlocal evidence_batch
+        while True:
+            try:
+                item = await asyncio.wait_for(found_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                # stop condition: if all tasks done and queue empty
+                if all(t.done() for t in tasks) and found_queue.empty():
+                    break
+                else:
+                    continue
+            if not item:
+                continue
+            test_url, payload, text = item
+            if test_url not in hits_set:
+                hits_set.add(test_url)
+                evidence_batch.append((test_url, payload, text))
+            # flush in batch
+            if len(evidence_batch) >= BATCH_EVIDENCE_FLUSH:
+                await flush_evidence(evidence_batch)
+                evidence_batch = []
+    # run producer and consumer
+    consumer_task = asyncio.create_task(consumer())
+    await asyncio.gather(*tasks)
+    # ensure consumer finishes
+    await consumer_task
+    # final flush
+    if evidence_batch:
+        await flush_evidence(evidence_batch)
+
+    # save hits
+    hits_file = os.path.join(OUTDIR, "xss_found_urls.txt")
+    async with aiofiles.open(hits_file, "w", encoding="utf-8") as f:
+        for h in sorted(hits_set):
+            await f.write(h + "\n")
+
+    print(Fore.GREEN + f"[✓] Done. Found {len(hits_set)} unique hits. Results in {hits_file}" + Style.RESET_ALL)
+    return sorted(hits_set)
+
+async def flush_evidence(batch):
+    ev_dir = ensure_dir(os.path.join(OUTDIR, "evidence"))
+    for test_url, payload, text in batch:
+        safe = safe_name_for_file(test_url)
+        fn = os.path.join(ev_dir, f"{safe}__resp.html")
+        try:
+            async with aiofiles.open(fn, "w", encoding="utf-8") as f:
+                await f.write(f"<!-- payload: {payload} -->\n")
+                await f.write(text or "")
+        except Exception:
+            pass
 
 # -------------------------
-# CLI
+# CLI + runner
 # -------------------------
 def parse_args():
-    parser = argparse.ArgumentParser(description="ZeroFox v2 — XSS Scanner (authorized use only)")
-    parser.add_argument("--workers", type=int, default=MAX_WORKERS, help="Jumlah worker paralel (default: 8)")
-    parser.add_argument("--rate-limit", type=float, default=RATE_LIMIT, help="Delay antar request (detik, default: 0.10)")
-    parser.add_argument("--timeout", type=int, default=SHORT_TIMEOUT, help="Timeout singkat request (detik, default: 3)")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Fast Async XSS Scanner (authorized only)")
+    p.add_argument("--targets", "-t", required=False, help="Single domain (domain.com) or path to file with URLs (one per line)")
+    p.add_argument("--workers", type=int, default=CONCURRENCY, help="Concurrency (default configured)")
+    p.add_argument("--proxies", help="Optional file with proxies (one per line)")
+    p.add_argument("--limit-urls", type=int, default=0, help="Limit number of parameterized URLs to scan (0 = no limit)")
+    return p.parse_args()
+
+def gather_target_urls(arg_target: Optional[str], limit: int=0) -> List[str]:
+    # if arg_target is a file => read URLs; if domain => query wayback and crawl; else error
+    if not arg_target:
+        print(Fore.RED + "[!] No target provided." + Style.RESET_ALL)
+        sys.exit(1)
+    if os.path.exists(arg_target):
+        with open(arg_target, "r", encoding="utf-8") as f:
+            urls = [l.strip() for l in f if l.strip()]
+        return filter_parameterized(urls, limit if limit>0 else None)
+    # treat as domain (domain.com)
+    domain = arg_target.strip()
+    print(Fore.CYAN + f"[~] Gathering URLs from Wayback + quick crawl for {domain} ..." + Style.RESET_ALL)
+    wayback = load_wayback(domain, limit=1000)
+    crawled = crawl_site(f"http://{domain}", max_depth=1, max_pages=200)
+    combined = list(dict.fromkeys(wayback + crawled))  # dedupe preserving order
+    return filter_parameterized(combined, limit if limit>0 else None)
+
+def load_proxies_from_file(path: Optional[str]) -> List[str]:
+    if not path:
+        return []
+    if not os.path.exists(path):
+        print(Fore.YELLOW + f"[!] Proxy file not found: {path}" + Style.RESET_ALL)
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        return [l.strip() for l in f if l.strip()]
+
+def chunk_smoke_payloads(payloads: List[str], count: int) -> List[str]:
+    if not payloads:
+        return []
+    # pick top N unique payloads (common ones)
+    return payloads[:count]
 
 def main():
     args = parse_args()
-    global MAX_WORKERS, RATE_LIMIT, SHORT_TIMEOUT
-    MAX_WORKERS = max(1, int(args.workers))
-    RATE_LIMIT = max(0.0, float(args.rate_limit))
-    SHORT_TIMEOUT = max(1, int(args.timeout))
+    proxies = load_proxies_from_file(args.proxies) if args.proxies else proxies_list
+    targets = gather_target_urls(args.targets, limit=args.limit_urls)
+    if not targets:
+        print(Fore.YELLOW + "[!] No parameterized URLs found to scan." + Style.RESET_ALL)
+        return
 
-    startup_animation()
-    print(Fore.GREEN + f"[CFG] workers={MAX_WORKERS}, rate_limit={RATE_LIMIT}s, timeout={SHORT_TIMEOUT}s" + Style.RESET_ALL)
-    print(Fore.GREEN + "\n[MODE] 1 = Scan 1 domain | 2 = Multi scan (bulk.txt)\n" + Style.RESET_ALL)
-    mode = input("Pilih mode (1/2): ").strip()
-    if mode == "2":
-        filepath = input("Masukkan path file list domain (contoh: targets.txt): ").strip()
-        if not os.path.exists(filepath):
-            print(Fore.RED + "[!] File tidak ditemukan." + Style.RESET_ALL)
-            return
-        with open(filepath) as f:
-            targets = [l.strip() for l in f if l.strip()]
-        for t in targets:
-            scan_domain(t, MAX_WORKERS, RATE_LIMIT, SHORT_TIMEOUT)
+    # load payloads
+    full_payloads = load_payloads(XSS_PAYLOAD_FILE)
+    if SMOKE_PAYLOAD_FILE:
+        smoke_payloads = load_payloads(SMOKE_PAYLOAD_FILE)
     else:
-        domain = input(Fore.YELLOW + "[>] Masukkan domain target: " + Style.RESET_ALL).strip()
-        scan_domain(domain, MAX_WORKERS, RATE_LIMIT, SHORT_TIMEOUT)
+        smoke_payloads = chunk_smoke_payloads(full_payloads, SMOKE_PAYLOAD_COUNT)
+
+    print(Fore.GREEN + f"[i] Targets to scan: {len(targets)} URLs" + Style.RESET_ALL)
+    print(Fore.GREEN + f"[i] Concurrency: {args.workers}, Proxies: {len(proxies)}" + Style.RESET_ALL)
+    # run
+    asyncio.run(run_scan(targets, smoke_payloads, full_payloads, args.workers, proxies))
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print(Fore.RED + "\n[!] Dibatalkan oleh user." + Style.RESET_ALL)
+    main()
